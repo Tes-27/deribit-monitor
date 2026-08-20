@@ -3,8 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- CSP: จำกัดปลายทางที่หน้าเว็บคุยได้ให้เหลือเฉพาะ 3 exchange + unpkg — ชั้นกันการยิง key ออกถ้ามี script แปลกปลอมหลุดเข้ามา -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://unpkg.com 'unsafe-inline'; style-src 'unsafe-inline'; connect-src wss://www.deribit.com wss://test.deribit.com https://api.bytick.com wss://stream.bytick.com wss://ws.phemex.com; img-src data:; base-uri 'none'; form-action 'none'; object-src 'none'">
 <title>Position Monitor — Deribit · Bybit · Phemex</title>
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
+        integrity="sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA"
+        crossorigin="anonymous"></script>
 <style>
   :root {
     --bg: #12151c; --panel: #1a1e28; --border: #2a2f3d;
@@ -249,6 +253,9 @@ const fmtP = n => {
   const d = a >= 1000 ? 1 : a >= 10 ? 2 : a >= 0.1 ? 4 : 6;
   return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 };
+// escape ทุก string ที่ไม่ใช่ค่าคงที่ก่อนลง innerHTML — กัน XSS จากชื่อพอร์ท/ข้อมูลจาก exchange
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 /* HMAC-SHA256 → hex — ใช้ WebCrypto ถ้ามี, มี fallback JS ล้วนเผื่อ context ที่ไม่ secure */
 async function hmacHex(secret, msg) {
@@ -998,7 +1005,7 @@ function rebuildInstrumentSel() {
       `<optgroup label="${label}">` +
       list.map(sym => {
         const k = ikey(ex, cat, sym);
-        return `<option value="${k}"${k === instrument ? " selected" : ""}>${sym}</option>`;
+        return `<option value="${esc(k)}"${k === instrument ? " selected" : ""}>${esc(sym)}</option>`;
       }).join("") + `</optgroup>`
     ).join("");
 }
@@ -1019,8 +1026,8 @@ function renderTabs() {
     html += `<div class="tab${activeTab === "overview" ? " active" : ""}" data-tab="overview">ภาพรวม</div>`;
   }
   html += accounts.map(a =>
-    `<div class="tab${activeTab === String(a.idx) ? " active" : ""}" data-tab="${a.idx}" title="${a.exchange}">
-       <span class="dot ${a.status}"></span>${a.name}</div>`
+    `<div class="tab${activeTab === String(a.idx) ? " active" : ""}" data-tab="${a.idx}" title="${esc(a.exchange)}">
+       <span class="dot ${a.status}"></span>${esc(a.name)}</div>`
   ).join("");
   bar.innerHTML = html;
 }
@@ -1074,13 +1081,13 @@ function renderLines() {
 }
 
 function posRowHtml(p) {
-  return `<div class="pos-row" data-inst="${p.key}">
-    <b>${p.symbol}</b>
+  return `<div class="pos-row" data-inst="${esc(p.key)}">
+    <b>${esc(p.symbol)}</b>
     <span class="${p.dirBuy ? "long" : "short"}">${p.dirBuy ? "LONG" : "SHORT"} ${fmt(p.size)}</span>
     <span><span class="lbl">entry</span> ${fmtP(p.entry)}</span>
     <span><span class="lbl">mark</span> ${fmtP(p.mark)}</span>
     <span><span class="lbl">liq</span> <span class="liq-val">${p.liq ? fmtP(p.liq) : "–"}</span></span>
-    <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + p.upnlCcy : ""}</span></span>
+    <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + esc(p.upnlCcy) : ""}</span></span>
   </div>`;
 }
 
@@ -1091,10 +1098,10 @@ function accBlockHtml(a) {
     mm = `<span><span class="lbl">MM</span> <span style="color:${a.mmPct > 50 ? "var(--liq)" : "inherit"}">${a.mmPct.toFixed(1)}%</span></span>`;
   }
   html += `<div class="acc-head">
-    <b>${a.name}</b><span class="ex-tag">${a.exchange}</span>
-    ${a.equityParts.length ? `<span><span class="lbl">equity</span> ${a.equityParts.join(" · ")}</span>` : ""}
+    <b>${esc(a.name)}</b><span class="ex-tag">${esc(a.exchange)}</span>
+    ${a.equityParts.length ? `<span><span class="lbl">equity</span> ${esc(a.equityParts.join(" · "))}</span>` : ""}
     ${mm}
-    ${a.error ? `<span class="acc-err">⚠ ${a.error}</span>` : ""}
+    ${a.error ? `<span class="acc-err">⚠ ${esc(a.error)}</span>` : ""}
   </div>`;
 
   if (!a.positions.length) {
@@ -1114,11 +1121,11 @@ function accBlockHtml(a) {
       catIdx(x.cat) - catIdx(y.cat) || x.symbol.localeCompare(y.symbol) || x.price - y.price);
     html += `<table>
       <tr><th>หมวด</th><th>Instrument</th><th>Side</th><th>Type</th><th>Price</th><th>Amount</th><th>Filled</th></tr>
-      ${sorted.map(o => `<tr data-inst="${o.key}">
+      ${sorted.map(o => `<tr data-inst="${esc(o.key)}">
         <td>${CAT_LABEL[o.cat]}</td>
-        <td>${o.symbol}</td>
+        <td>${esc(o.symbol)}</td>
         <td class="${o.dirBuy ? "long" : "short"}">${o.dirBuy ? "BUY" : "SELL"}</td>
-        <td>${o.type}</td>
+        <td>${esc(o.type)}</td>
         <td>${fmtP(o.price)}</td>
         <td>${fmt(o.amount)}</td>
         <td>${fmt(o.filled)}</td>
@@ -1151,7 +1158,7 @@ function renderPanels() {
     }));
     const parts = [...totals.entries()].map(([ccy, v]) => ccy === "USD" ? `$${fmtP(v)}` : `${fmt(v)} ${ccy}`);
     totalEl.innerHTML = parts.length
-      ? `<div class="total-row"><span><span class="lbl">equity รวมทุกพอร์ท</span> <b>${parts.join(" · ")}</b></span></div>`
+      ? `<div class="total-row"><span><span class="lbl">equity รวมทุกพอร์ท</span> <b>${esc(parts.join(" · "))}</b></span></div>`
       : "";
   } else {
     totalEl.innerHTML = "";
@@ -1202,9 +1209,9 @@ function accEditRow(a) {
   div.innerHTML = `
     <select class="e-ex">${EXCHANGES.map(x =>
       `<option value="${x}"${a && a.exchange === x ? " selected" : ""}>${x}</option>`).join("")}</select>
-    <input type="text" class="e-name" placeholder="เช่น Main" value="${a?.name || ""}">
-    <input type="text" class="e-id" autocomplete="off" value="${a?.clientId || ""}">
-    <input type="password" class="e-secret" autocomplete="off" value="${a?.clientSecret || ""}">
+    <input type="text" class="e-name" placeholder="เช่น Main" value="${esc(a?.name || "")}">
+    <input type="text" class="e-id" autocomplete="off" value="${esc(a?.clientId || "")}">
+    <input type="password" class="e-secret" autocomplete="off" value="${esc(a?.clientSecret || "")}">
     <button class="btn-x" title="ลบพอร์ทนี้">✕</button>`;
   div.querySelector(".btn-x").onclick = () => div.remove();
   return div;
