@@ -1,0 +1,1266 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Position Monitor — Deribit · Bybit · Phemex</title>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #12151c; --panel: #1a1e28; --border: #2a2f3d;
+    --text: #d5dae6; --muted: #7d8598;
+    --green: #26a69a; --red: #ef5350; --blue: #4a90d9;
+    --orange: #ff9f43; --liq: #ff3b5c;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  select, button {
+    background: #232836; color: var(--text); border: 1px solid var(--border);
+    border-radius: 5px; padding: 5px 9px; font-size: 13px; cursor: pointer;
+  }
+  select:hover, button:hover { border-color: #3d4557; }
+  .tf-group { display: flex; gap: 2px; }
+  .tf-group button { padding: 5px 8px; border-radius: 0; border-right: none; }
+  .tf-group button:first-child { border-radius: 5px 0 0 5px; }
+  .tf-group button:last-child { border-radius: 0 5px 5px 0; border-right: 1px solid var(--border); }
+  .tf-group button.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  #exBadge {
+    font-size: 10px; font-weight: 700; letter-spacing: .8px; padding: 3px 7px;
+    border-radius: 4px; background: #232836; color: var(--muted); text-transform: uppercase;
+  }
+  #lastPrice { font-size: 16px; font-weight: 600; min-width: 90px; }
+  .spacer { flex: 1; }
+  #connDot { width: 9px; height: 9px; border-radius: 50%; background: #666; display: inline-block; }
+  #connDot.on { background: var(--green); }
+  #connDot.err { background: var(--red); }
+  #connLabel { color: var(--muted); font-size: 12px; }
+  #tabbar {
+    display: flex; gap: 4px; padding: 6px 12px 0; background: var(--panel);
+    border-bottom: 1px solid var(--border); overflow-x: auto;
+  }
+  #tabbar:empty { display: none; }
+  .tab {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 13px; border: 1px solid var(--border); border-bottom: none;
+    border-radius: 7px 7px 0 0; background: #161a24; color: var(--muted);
+    cursor: pointer; white-space: nowrap; font-size: 13px; user-select: none;
+  }
+  .tab.active { background: var(--bg); color: var(--text); border-color: #3d4557; }
+  .tab .dot { width: 7px; height: 7px; border-radius: 50%; background: #666; }
+  .tab .dot.on { background: var(--green); }
+  .tab .dot.err { background: var(--red); }
+  #chart { flex: 1; min-height: 0; }
+  footer {
+    background: var(--panel); border-top: 1px solid var(--border);
+    padding: 8px 12px; max-height: 38vh; overflow-y: auto;
+  }
+  .total-row {
+    display: flex; gap: 20px; flex-wrap: wrap; padding: 4px 0 8px;
+    border-bottom: 1px solid var(--border); margin-bottom: 6px; font-size: 13px;
+  }
+  .acc-block { margin-bottom: 10px; }
+  .acc-head {
+    display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+    padding: 5px 0 2px; font-size: 13px;
+  }
+  .acc-head b { font-size: 14px; color: var(--blue); }
+  .ex-tag {
+    font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
+    color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
+  }
+  .acc-err { color: var(--red); font-size: 12px; }
+  .cat-label {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .6px; margin: 6px 0 1px; font-weight: 600;
+  }
+  .pos-row {
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+    padding: 3px 6px; cursor: pointer; border-radius: 4px;
+  }
+  .pos-row:hover { background: #222736; }
+  .pos-row b { font-size: 13px; }
+  .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+  .long { color: var(--green); } .short { color: var(--red); }
+  .liq-val { color: var(--liq); font-weight: 600; }
+  .pnl-pos { color: var(--green); } .pnl-neg { color: var(--red); }
+  table { border-collapse: collapse; width: 100%; margin-top: 4px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+       text-transform: uppercase; letter-spacing: .4px; padding: 3px 14px 3px 0; }
+  td { padding: 3px 14px 3px 0; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  tr[data-inst] { cursor: pointer; }
+  tr[data-inst]:hover td { background: #222736; }
+  .empty { color: var(--muted); padding: 6px 0; }
+  #modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  #modal.show { display: flex; }
+  .modal-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 22px; width: 680px; max-width: 96vw; max-height: 88vh; overflow-y: auto;
+  }
+  .modal-box h2 { font-size: 16px; margin-bottom: 4px; }
+  .modal-box p { color: var(--muted); font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
+  .acc-edit-row, .acc-edit-head {
+    display: grid; grid-template-columns: 95px 100px 1fr 1fr 28px; gap: 6px;
+    margin-bottom: 6px; align-items: center;
+  }
+  .acc-edit-head {
+    color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+    margin-bottom: 3px;
+  }
+  .modal-box input[type=text], .modal-box input[type=password], .modal-box select {
+    width: 100%; background: #232836; border: 1px solid var(--border); border-radius: 5px;
+    padding: 6px 8px; color: var(--text); font-size: 12.5px;
+  }
+  .btn-x { color: var(--red); padding: 4px 0; text-align: center; }
+  .check-row { display: flex; align-items: center; gap: 7px; margin: 12px 0; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+  .btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .warn { background: #2b2416; border: 1px solid #5c4a1e; border-radius: 6px;
+          padding: 8px 10px; font-size: 12px; color: #e0c060; margin-top: 12px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<header>
+  <select id="instrumentSel"></select>
+  <div class="tf-group" id="tfGroup"></div>
+  <span id="exBadge"></span>
+  <span id="lastPrice">–</span>
+  <span id="liqDistance" class="lbl"></span>
+  <div class="spacer"></div>
+  <span id="connDot"></span><span id="connLabel">offline</span>
+  <button id="btnSettings">⚙ ตั้งค่า</button>
+</header>
+
+<div id="tabbar"></div>
+
+<div id="chart"></div>
+
+<footer>
+  <div id="totalPanel"></div>
+  <div id="accPanels" class="empty">ยังไม่มีข้อมูล</div>
+</footer>
+
+<div id="modal">
+  <div class="modal-box">
+    <h2>ตั้งค่าพอร์ท</h2>
+    <p>รองรับ Deribit / Bybit / Phemex — สร้าง API key แบบ <b>read-only เท่านั้น</b>:
+       Deribit ให้สิทธิ์ account:read + trade:read · Bybit เลือก Read-Only ·
+       Phemex ไม่ติ๊กสิทธิ์ Trade — key ถูกเก็บใน localStorage บนเครื่องนี้เครื่องเดียว</p>
+    <div class="acc-edit-head"><span>Exchange</span><span>ชื่อพอร์ท</span><span>API Key / Client ID</span><span>Secret</span><span></span></div>
+    <div id="accList"></div>
+    <button id="btnAddAcc">+ เพิ่มพอร์ท</button>
+    <div class="check-row">
+      <input type="checkbox" id="inTestnet">
+      <label for="inTestnet" style="margin:0">ใช้ Testnet — มีผลเฉพาะพอร์ท Deribit (Bybit/Phemex ชี้ mainnet เสมอ)</label>
+    </div>
+    <div class="warn">Bybit ต่อผ่านโดเมนสำรองทางการ api.bytick.com (เพราะ api.bybit.com ถูกบล็อก DNS จากเน็ตไทย)
+      · Phemex ใช้ WebSocket ล้วนเพราะ REST ของเขาไม่เปิด CORS ให้ browser</div>
+    <div class="modal-actions">
+      <button id="btnCancel">ปิด</button>
+      <button id="btnSave" class="btn-primary">บันทึก & เชื่อมต่อ</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ================= storage / config ================= */
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+const LS_KEY = "deribit_monitor_config";
+
+const EXCHANGES = ["deribit", "bybit", "phemex"];
+const BYBIT_REST = "https://api.bytick.com";       // โดเมนสำรองทางการ (api.bybit.com โดนบล็อก DNS ใน TH)
+const BYBIT_WS = "wss://stream.bytick.com";
+const PHEMEX_WS = "wss://ws.phemex.com";
+
+const CAT_ORDER = ["inverse", "future", "option", "spot"];
+const CAT_LABEL = { inverse: "Future Inverse", future: "Future", option: "Option", spot: "Spot" };
+
+// timeframe: เก็บเป็น label กลาง แล้ว map เป็นค่า native ของแต่ละ exchange
+const TF_LABELS = {
+  deribit: ["1m", "5m", "15m", "1h", "6h", "1D"],
+  bybit: ["1m", "5m", "15m", "1h", "6h", "1D"],
+  phemex: ["1m", "5m", "15m", "1h", "4h", "1D"], // phemex ไม่มี 6h
+};
+const TF_SEC = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "6h": 21600, "1D": 86400 };
+const TF_NATIVE = {
+  deribit: { "1m": "1", "5m": "5", "15m": "15", "1h": "60", "6h": "360", "1D": "1D" },
+  bybit: { "1m": "1", "5m": "5", "15m": "15", "1h": "60", "6h": "360", "1D": "D" },
+  phemex: { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1D": 86400 },
+};
+const BAR_COUNT = 500;
+const DERIBIT_CCY = ["BTC", "USDC", "USDT"];
+
+// instrument key = "exchange|category|symbol"
+const ikey = (ex, cat, sym) => `${ex}|${cat}|${sym}`;
+const iparse = k => { const [ex, cat, sym] = k.split("|"); return { ex, cat, sym }; };
+
+// deribit: จำแนกหมวดจากชื่อ | phemex: จากรูปแบบ symbol
+function deribitCat(name) {
+  if (/-\d+(\.\d+)?-[CP]$/.test(name)) return "option";
+  if (name.includes("_")) return name.includes("-") ? "future" : "spot";
+  return "inverse";
+}
+function phemexCat(sym) {
+  if (sym.startsWith("s")) return "spot";
+  return sym.endsWith("USDT") ? "future" : "inverse";
+}
+
+function loadCfg() {
+  let c;
+  try { c = JSON.parse(store.get(LS_KEY)) || {}; } catch { c = {}; }
+  if (c.clientId && !c.accounts) {           // migrate เวอร์ชันพอร์ทเดียว
+    c = { accounts: [{ name: "Main", clientId: c.clientId, clientSecret: c.clientSecret }], testnet: !!c.testnet };
+  }
+  if (!Array.isArray(c.accounts)) c.accounts = [];
+  c.accounts.forEach(a => { if (!a.exchange) a.exchange = "deribit"; }); // migrate เวอร์ชัน deribit-only
+  store.set(LS_KEY, JSON.stringify(c));
+  return c;
+}
+
+let cfg = loadCfg();
+let instrument = store.get("deribit_monitor_instrument") || "deribit|inverse|BTC-PERPETUAL";
+if (!instrument.includes("|")) instrument = ikey("deribit", deribitCat(instrument), instrument);
+let tfLabel = store.get("deribit_monitor_tf") || "1h";
+let activeTab = store.get("deribit_monitor_tab") || "overview";
+
+/* ================= utils ================= */
+const fmt = n => n == null || isNaN(n) ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 8 });
+const fmtP = n => {
+  if (n == null || isNaN(n)) return "–";
+  n = Number(n);
+  const a = Math.abs(n);
+  const d = a >= 1000 ? 1 : a >= 10 ? 2 : a >= 0.1 ? 4 : 6;
+  return n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+};
+
+/* HMAC-SHA256 → hex — ใช้ WebCrypto ถ้ามี, มี fallback JS ล้วนเผื่อ context ที่ไม่ secure */
+async function hmacHex(secret, msg) {
+  if (window.crypto && crypto.subtle) {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", enc.encode(secret),
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
+    return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+  return hmacFallback(secret, msg);
+}
+// SHA-256 + HMAC แบบ JS ล้วน (ตามสเปก FIPS 180-4)
+function sha256Bytes(bytes) {
+  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const l = bytes.length;
+  const bitLen = l * 8;
+  const padded = new Uint8Array(((l + 8) >> 6 << 6) + 64);
+  padded.set(bytes); padded[l] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 4, bitLen >>> 0);
+  dv.setUint32(padded.length - 8, Math.floor(bitLen / 0x100000000));
+  const w = new Int32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let i = 0; i < padded.length; i += 64) {
+    for (let t = 0; t < 16; t++) w[t] = dv.getInt32(i + t * 4);
+    for (let t = 16; t < 64; t++) {
+      const s0 = rotr(w[t-15],7) ^ rotr(w[t-15],18) ^ (w[t-15] >>> 3);
+      const s1 = rotr(w[t-2],17) ^ rotr(w[t-2],19) ^ (w[t-2] >>> 10);
+      w[t] = (w[t-16] + s0 + w[t-7] + s1) | 0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let t = 0; t < 64; t++) {
+      const S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[t] + w[t]) | 0;
+      const S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H = H.map((x, i) => (x + [a,b,c,d,e,f,g,h][i]) | 0);
+  }
+  const out = new Uint8Array(32);
+  H.forEach((x, i) => new DataView(out.buffer).setInt32(i * 4, x));
+  return out;
+}
+function hmacFallback(secret, msg) {
+  const enc = new TextEncoder();
+  let key = enc.encode(secret);
+  if (key.length > 64) key = sha256Bytes(key);
+  const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ipad[i] = (key[i] || 0) ^ 0x36; opad[i] = (key[i] || 0) ^ 0x5c; }
+  const m = enc.encode(msg);
+  const inner = new Uint8Array(64 + m.length); inner.set(ipad); inner.set(m, 64);
+  const ih = sha256Bytes(inner);
+  const outer = new Uint8Array(96); outer.set(opad); outer.set(ih, 64);
+  return [...sha256Bytes(outer)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/* ================= chart ================= */
+const chartEl = document.getElementById("chart");
+const chart = LightweightCharts.createChart(chartEl, {
+  layout: { background: { color: "#12151c" }, textColor: "#7d8598" },
+  grid: { vertLines: { color: "#1c202b" }, horzLines: { color: "#1c202b" } },
+  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2a2f3d" },
+  rightPriceScale: { borderColor: "#2a2f3d" },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+});
+const series = chart.addCandlestickSeries({
+  upColor: "#26a69a", downColor: "#ef5350",
+  wickUpColor: "#26a69a", wickDownColor: "#ef5350", borderVisible: false,
+});
+new ResizeObserver(() => chart.applyOptions({
+  width: chartEl.clientWidth, height: chartEl.clientHeight,
+})).observe(chartEl);
+
+let priceLines = [];
+function clearPriceLines() {
+  priceLines.forEach(l => series.removePriceLine(l));
+  priceLines = [];
+}
+function addLine(price, color, title, style, width) {
+  if (!price || price <= 0) return;
+  priceLines.push(series.createPriceLine({
+    price, color, title, lineWidth: width || 1, lineStyle: style, axisLabelVisible: true,
+  }));
+}
+let lastPrice = null;
+
+/* ================= generic websocket (reconnect + ping) ================= */
+function createWS({ url, onOpen, onMessage, onStatus, pingText, pingSec }) {
+  let ws = null, closed = false, delay = 1000, pingTimer = null;
+  function open() {
+    if (closed) return;
+    onStatus && onStatus("", "connecting…");
+    ws = new WebSocket(url);
+    ws.onopen = async () => {
+      delay = 1000;
+      if (pingText && pingSec) {
+        clearInterval(pingTimer);
+        pingTimer = setInterval(() => { try { ws.send(pingText); } catch {} }, pingSec * 1000);
+      }
+      try { await onOpen(m => ws.send(m)); onStatus && onStatus("on", ""); }
+      catch (e) { console.error("ws init:", e); onStatus && onStatus("err", e.message || String(e)); }
+    };
+    ws.onmessage = ev => onMessage(ev.data, m => { try { ws.send(m); } catch {} });
+    ws.onclose = () => {
+      clearInterval(pingTimer);
+      if (closed) return;
+      onStatus && onStatus("err", "reconnecting…");
+      setTimeout(open, delay);
+      delay = Math.min(delay * 2, 30000);
+    };
+    ws.onerror = () => {};
+  }
+  open();
+  return {
+    send(m) { try { ws.send(m); } catch {} },
+    close() { closed = true; clearInterval(pingTimer); if (ws) { try { ws.close(); } catch {} } },
+  };
+}
+
+/* ================= deribit JSON-RPC connection ================= */
+function deribitUrl() {
+  return cfg.testnet ? "wss://test.deribit.com/ws/api/v2" : "wss://www.deribit.com/ws/api/v2";
+}
+function createDeribitConn({ onOpen, onSub, onStatus }) {
+  let rpcId = 0;
+  const pending = new Map();
+  let sendFn = null;
+  const ws = createWS({
+    url: deribitUrl(),
+    onOpen: async send => {
+      sendFn = send;
+      pending.forEach(p => p.reject(new Error("reconnected")));
+      pending.clear();
+      await rpc("public/set_heartbeat", { interval: 30 });
+      await onOpen();
+    },
+    onMessage: (data, send) => {
+      const msg = JSON.parse(data);
+      if (msg.id !== undefined && pending.has(msg.id)) {
+        const p = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) p.reject(new Error(msg.error.message + " (" + msg.error.code + ")"));
+        else p.resolve(msg.result);
+        return;
+      }
+      if (msg.method === "heartbeat") {
+        if (msg.params && msg.params.type === "test_request") rpc("public/test", {}).catch(() => {});
+        return;
+      }
+      if (msg.method === "subscription") onSub && onSub(msg.params);
+    },
+    onStatus,
+  });
+  function rpc(method, params) {
+    return new Promise((resolve, reject) => {
+      if (!sendFn) return reject(new Error("not connected"));
+      const id = ++rpcId;
+      pending.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} }));
+    });
+  }
+  return { rpc, close: () => ws.close() };
+}
+
+/* ================= market data: deribit public ================= */
+let pub = null;
+let deribitGroups = { inverse: [], future: [], spot: [] };
+let deribitChartChannel = null;
+let deribitTickerChannel = null; // ใช้กับ option: mark price ขยับแม้ไม่มี trade
+
+function setConn(state, label) {
+  document.getElementById("connDot").className = state;
+  document.getElementById("connLabel").textContent =
+    label || (state === "on" ? (cfg.testnet ? "testnet(dbt)" : "live") : "offline");
+}
+
+function startPublic() {
+  pub = createDeribitConn({
+    onOpen: async () => {
+      await loadDeribitInstruments();
+      deribitChartChannel = null;
+      if (iparse(instrument).ex === "deribit") await loadChart();
+    },
+    onSub: params => {
+      if (params.channel === deribitChartChannel) {
+        const d = params.data;
+        series.update({ time: d.tick / 1000, open: d.open, high: d.high, low: d.low, close: d.close });
+        lastPrice = d.close;
+        renderHeader();
+      } else if (params.channel === deribitTickerChannel && params.data.mark_price) {
+        lastPrice = params.data.mark_price;
+        renderHeader();
+      }
+    },
+    onStatus: (s, msg) => { if (iparse(instrument).ex === "deribit" || s === "on") setConn(s, msg); },
+  });
+}
+
+async function loadDeribitInstruments() {
+  const [inv, linUsdc, linUsdt, spot] = await Promise.all([
+    pub.rpc("public/get_instruments", { currency: "BTC", kind: "future" }).catch(() => []),
+    pub.rpc("public/get_instruments", { currency: "USDC", kind: "future" }).catch(() => []),
+    pub.rpc("public/get_instruments", { currency: "USDT", kind: "future" }).catch(() => []),
+    pub.rpc("public/get_instruments", { currency: "BTC", kind: "spot" }).catch(() => []),
+  ]);
+  const names = list => list.map(i => i.instrument_name);
+  const perpFirst = arr => arr.sort((a, b) => {
+    const ap = a.includes("PERPETUAL"), bp = b.includes("PERPETUAL");
+    if (ap !== bp) return ap ? -1 : 1;
+    return a.localeCompare(b);
+  });
+  deribitGroups.inverse = perpFirst(names(inv));
+  deribitGroups.future = perpFirst([...names(linUsdc), ...names(linUsdt)].filter(n => n.startsWith("BTC_")));
+  deribitGroups.spot = names(spot).sort();
+  rebuildInstrumentSel();
+}
+
+/* ================= market data: bybit ================= */
+let bybitGroups = { inverse: [], future: [], spot: [] };
+const bybitApiCat = cat => cat === "future" ? "linear" : cat; // ชื่อ category ฝั่ง API
+
+async function loadBybitInstruments() {
+  async function ls(apiCat, filter) {
+    try {
+      const r = await fetch(`${BYBIT_REST}/v5/market/instruments-info?category=${apiCat}&limit=1000`);
+      const j = await r.json();
+      if (j.retCode !== 0) return [];
+      return j.result.list.map(i => i.symbol).filter(filter).sort((a, b) => {
+        const ap = a === "BTCUSD" || a === "BTCUSDT" || a === "BTCPERP";
+        const bp = b === "BTCUSD" || b === "BTCUSDT" || b === "BTCPERP";
+        if (ap !== bp) return ap ? -1 : 1;
+        return a.localeCompare(b);
+      });
+    } catch { return []; }
+  }
+  const isBtc = s => s.startsWith("BTC");
+  [bybitGroups.inverse, bybitGroups.future, bybitGroups.spot] = await Promise.all([
+    ls("inverse", isBtc), ls("linear", isBtc), ls("spot", isBtc),
+  ]);
+  rebuildInstrumentSel();
+}
+
+/* ================= market data: phemex (สัญลักษณ์หลักแบบ static) ================= */
+const phemexGroups = { inverse: ["BTCUSD"], future: ["BTCUSDT"] };
+const PHEMEX_SCALE_P = 1e4;  // สเกลราคา contract รุ่น v1 (BTCUSD)
+const PHEMEX_SCALE_V = 1e8;  // สเกลมูลค่า (Ev)
+
+/* ================= chart controller ================= */
+let chartSrc = null;      // {stop()} ของ source ปัจจุบัน
+let chartToken = 0;       // กันการสลับกราฟซ้อนกัน
+
+function tfForExchange(ex) {
+  if (!TF_LABELS[ex].includes(tfLabel)) tfLabel = "1h";
+  return tfLabel;
+}
+
+async function loadChart() {
+  const my = ++chartToken;
+  if (chartSrc) { chartSrc.stop(); chartSrc = null; }
+  const { ex, cat, sym } = iparse(instrument);
+  tfForExchange(ex);
+  renderTf(ex);
+  document.getElementById("exBadge").textContent = ex;
+  series.setData([]);
+  lastPrice = null;
+  try {
+    if (ex === "deribit") chartSrc = await chartDeribit(sym, my);
+    else if (ex === "bybit") chartSrc = await chartBybit(cat, sym, my);
+    else if (ex === "phemex") chartSrc = await chartPhemex(cat, sym, my);
+    if (my !== chartToken && chartSrc) { chartSrc.stop(); chartSrc = null; return; }
+    renderAll();
+  } catch (e) {
+    console.error("loadChart:", e);
+    if (my === chartToken) setConn("err", "chart: " + (e.message || e));
+  }
+}
+
+async function chartDeribit(sym, my) {
+  const res = TF_NATIVE.deribit[tfLabel];
+  const end = Date.now();
+  const start = end - BAR_COUNT * TF_SEC[tfLabel] * 1000;
+  const d = await pub.rpc("public/get_tradingview_chart_data", {
+    instrument_name: sym, start_timestamp: start, end_timestamp: end, resolution: res,
+  });
+  if (my !== chartToken) return { stop() {} };
+  const bars = (d.ticks || []).map((t, i) => ({
+    time: t / 1000, open: d.open[i], high: d.high[i], low: d.low[i], close: d.close[i],
+  }));
+  series.setData(bars);
+  lastPrice = bars.length ? bars[bars.length - 1].close : null;
+  chart.timeScale().fitContent();
+  const chans = [`chart.trades.${sym}.${res}`];
+  deribitChartChannel = chans[0];
+  if (deribitCat(sym) === "option") { // option ไม่ค่อยมี trade — ตาม mark price ด้วย
+    chans.push(`ticker.${sym}.100ms`);
+    deribitTickerChannel = chans[1];
+  } else deribitTickerChannel = null;
+  await pub.rpc("public/subscribe", { channels: chans });
+  setConn("on");
+  return {
+    stop() {
+      deribitChartChannel = null;
+      deribitTickerChannel = null;
+      pub.rpc("public/unsubscribe", { channels: chans }).catch(() => {});
+    },
+  };
+}
+
+async function chartBybit(cat, sym, my) {
+  const interval = TF_NATIVE.bybit[tfLabel];
+  const apiCat = bybitApiCat(cat);
+  const r = await fetch(`${BYBIT_REST}/v5/market/kline?category=${apiCat}&symbol=${sym}&interval=${interval}&limit=${BAR_COUNT}`);
+  const j = await r.json();
+  if (j.retCode !== 0) throw new Error("bybit kline: " + j.retMsg);
+  if (my !== chartToken) return { stop() {} };
+  const bars = j.result.list.map(row => ({
+    time: +row[0] / 1000, open: +row[1], high: +row[2], low: +row[3], close: +row[4],
+  })).reverse();
+  series.setData(bars);
+  lastPrice = bars.length ? bars[bars.length - 1].close : null;
+  chart.timeScale().fitContent();
+  const topic = `kline.${interval}.${sym}`;
+  const ws = createWS({
+    url: `${BYBIT_WS}/v5/public/${apiCat}`,
+    pingText: '{"op":"ping"}', pingSec: 20,
+    onOpen: async send => send(JSON.stringify({ op: "subscribe", args: [topic] })),
+    onMessage: data => {
+      const m = JSON.parse(data);
+      if (m.topic !== topic || !m.data) return;
+      m.data.forEach(d => {
+        series.update({ time: d.start / 1000, open: +d.open, high: +d.high, low: +d.low, close: +d.close });
+        lastPrice = +d.close;
+      });
+      renderHeader();
+    },
+    onStatus: (s, msg) => { if (iparse(instrument).ex === "bybit") setConn(s, msg && "bybit: " + msg); },
+  });
+  return { stop() { ws.close(); } };
+}
+
+async function chartPhemex(cat, sym, my) {
+  const res = TF_NATIVE.phemex[tfLabel];
+  const usdtM = cat !== "inverse";                    // BTCUSDT ใช้ชุด method _p (ค่าไม่สเกล)
+  const method = usdtM ? "kline_p.subscribe" : "kline.subscribe";
+  const field = usdtM ? "kline_p" : "kline";
+  const px = v => usdtM ? +v : +v / PHEMEX_SCALE_P;
+  let lastBarTime = 0;
+  const ws = createWS({
+    url: PHEMEX_WS,
+    pingText: '{"id":9000,"method":"server.ping","params":[]}', pingSec: 15,
+    onOpen: async send => send(JSON.stringify({ id: 11, method, params: [sym, res] })),
+    onMessage: data => {
+      const m = JSON.parse(data);
+      const rows = m[field];
+      if (!rows || my !== chartToken) return;
+      // แถว: [ts, interval, lastClose, open, high, low, close, volume, turnover]
+      const bars = rows.map(r0 => ({
+        time: r0[0], open: px(r0[3]), high: px(r0[4]), low: px(r0[5]), close: px(r0[6]),
+      })).sort((a, b) => a.time - b.time);
+      if (m.type === "snapshot") {
+        const sliced = bars.slice(-BAR_COUNT);
+        series.setData(sliced);
+        lastBarTime = sliced.length ? sliced[sliced.length - 1].time : 0;
+        lastPrice = sliced.length ? sliced[sliced.length - 1].close : null;
+        chart.timeScale().fitContent();
+      } else {
+        bars.forEach(b => {
+          if (b.time < lastBarTime) return;
+          series.update(b);
+          lastBarTime = b.time;
+          lastPrice = b.close;
+        });
+      }
+      renderHeader();
+    },
+    onStatus: (s, msg) => { if (iparse(instrument).ex === "phemex") setConn(s, msg && "phemex: " + msg); },
+  });
+  return { stop() { ws.close(); } };
+}
+
+/* ================= accounts ================= */
+let accounts = [];
+
+function buildAccounts() {
+  accounts = cfg.accounts.map((a, idx) => ({
+    idx, exchange: a.exchange || "deribit", name: a.name || `Port ${idx + 1}`,
+    key: a.clientId, secret: a.clientSecret,
+    conn: null, authed: false, error: null, status: "",
+    positions: [], orders: [], equityParts: [], mmPct: null,
+    authTimer: null, refreshQueued: false,
+    px: null, // state ของ phemex (merge จาก AOP)
+  }));
+}
+
+function startAccount(acc) {
+  if (acc.exchange === "deribit") startDeribitAccount(acc);
+  else if (acc.exchange === "bybit") startBybitAccount(acc);
+  else if (acc.exchange === "phemex") startPhemexAccount(acc);
+}
+
+function accStatus(acc) {
+  return (s, msg) => {
+    acc.status = s;
+    if (s === "err" && msg && !msg.startsWith("reconnect") && !msg.startsWith("connecting")) acc.error = msg;
+    if (s === "on" && !acc.error) acc.error = null;
+    renderTabs();
+    if (s === "err") renderPanels();
+  };
+}
+
+function queueRefresh(acc, fn) {
+  if (acc.refreshQueued) return;
+  acc.refreshQueued = true;
+  setTimeout(() => { acc.refreshQueued = false; fn(acc).catch(console.error); }, 700);
+}
+
+/* ---------- deribit account ---------- */
+function startDeribitAccount(acc) {
+  acc.conn = createDeribitConn({
+    onOpen: async () => {
+      acc.error = null;
+      await deribitAuth(acc);
+      await refreshDeribit(acc);
+      await acc.conn.rpc("private/subscribe", {
+        channels: DERIBIT_CCY.map(c => `user.changes.any.${c}.raw`),
+      }).catch(() => {});
+    },
+    onSub: params => {
+      if (params.channel.startsWith("user.changes.")) queueRefresh(acc, refreshDeribit);
+    },
+    onStatus: accStatus(acc),
+  });
+}
+
+async function deribitAuth(acc) {
+  const r = await acc.conn.rpc("public/auth", {
+    grant_type: "client_credentials", client_id: acc.key, client_secret: acc.secret,
+  });
+  acc.authed = true;
+  clearTimeout(acc.authTimer);
+  acc.authTimer = setTimeout(() => {
+    deribitAuth(acc).catch(e => { acc.authed = false; acc.error = e.message; renderAll(); });
+  }, Math.max((r.expires_in - 60) * 1000, 60000));
+}
+
+async function refreshDeribit(acc) {
+  if (!acc.authed) return;
+  const posLists = await Promise.all(DERIBIT_CCY.map(c =>
+    acc.conn.rpc("private/get_positions", { currency: c }).catch(() => [])));
+  const ordLists = await Promise.all(DERIBIT_CCY.map(c =>
+    acc.conn.rpc("private/get_open_orders_by_currency", { currency: c }).catch(() => [])));
+  const sums = await Promise.all(["BTC", "USDC"].map(c =>
+    acc.conn.rpc("private/get_account_summary", { currency: c }).catch(() => null)));
+
+  acc.positions = posLists.flat().filter(p => p.size !== 0).map(p => ({
+    key: ikey("deribit", deribitCat(p.instrument_name), p.instrument_name),
+    symbol: p.instrument_name, cat: deribitCat(p.instrument_name),
+    dirBuy: p.direction === "buy", size: Math.abs(p.size),
+    entry: p.average_price, mark: p.mark_price,
+    liq: p.estimated_liquidation_price || null,
+    upnl: p.floating_profit_loss, upnlCcy: "",
+  }));
+  acc.orders = ordLists.flat().map(o => ({
+    key: ikey("deribit", deribitCat(o.instrument_name), o.instrument_name),
+    symbol: o.instrument_name, cat: deribitCat(o.instrument_name),
+    dirBuy: o.direction === "buy", type: o.order_type,
+    price: o.price, amount: o.amount, filled: o.filled_amount,
+  }));
+  acc.equityParts = [];
+  if (sums[0]) acc.equityParts.push(`${fmt(sums[0].equity)} BTC`);
+  if (sums[1] && sums[1].equity > 0.01) acc.equityParts.push(`${fmtP(sums[1].equity)} USDC`);
+  acc.mmPct = sums[0] && sums[0].equity > 0 && sums[0].maintenance_margin > 0
+    ? sums[0].maintenance_margin / sums[0].equity * 100 : null;
+  rebuildInstrumentSel();
+  renderAll();
+}
+
+/* ---------- bybit account (REST + private WS trigger) ---------- */
+async function bybitFetch(acc, path, params) {
+  const qs = new URLSearchParams(params).toString();
+  const ts = Date.now().toString(), rw = "10000";
+  const sign = await hmacHex(acc.secret, ts + acc.key + rw + qs);
+  const r = await fetch(`${BYBIT_REST}${path}?${qs}`, {
+    headers: {
+      "X-BAPI-API-KEY": acc.key, "X-BAPI-TIMESTAMP": ts,
+      "X-BAPI-RECV-WINDOW": rw, "X-BAPI-SIGN": sign,
+    },
+  });
+  const j = await r.json();
+  if (j.retCode !== 0) throw new Error(`${j.retMsg} (${j.retCode})`);
+  return j.result;
+}
+
+// ดึงให้ครบทุกหน้า — bybit ส่งเป็น page (order default แค่ 20 รายการ) ต้องตาม nextPageCursor
+async function bybitFetchList(acc, path, params, pageLimit) {
+  let cursor = "", out = [];
+  for (let i = 0; i < 20; i++) {
+    const p = { ...params, limit: String(pageLimit) };
+    if (cursor) p.cursor = cursor;
+    const r = await bybitFetch(acc, path, p);
+    const list = r.list || [];
+    out = out.concat(list);
+    cursor = r.nextPageCursor;
+    if (!cursor || !list.length) break;
+  }
+  return out;
+}
+
+function startBybitAccount(acc) {
+  refreshBybit(acc).then(() => { acc.status = "on"; renderTabs(); })
+    .catch(e => { acc.error = e.message; acc.status = "err"; renderAll(); });
+  acc.conn = createWS({
+    url: `${BYBIT_WS}/v5/private`,
+    pingText: '{"op":"ping"}', pingSec: 20,
+    onOpen: async send => {
+      const expires = Date.now() + 10000;
+      const sig = await hmacHex(acc.secret, "GET/realtime" + expires);
+      send(JSON.stringify({ op: "auth", args: [acc.key, expires, sig] }));
+      send(JSON.stringify({ op: "subscribe", args: ["position", "order", "wallet"] }));
+    },
+    onMessage: data => {
+      const m = JSON.parse(data);
+      if (m.op === "auth" && m.success === false) {
+        acc.error = "auth: " + (m.ret_msg || "failed"); acc.status = "err"; renderAll(); return;
+      }
+      if (m.topic) queueRefresh(acc, refreshBybit);
+    },
+    onStatus: accStatus(acc),
+  });
+}
+
+async function refreshBybit(acc) {
+  const posSpecs = [
+    ["inverse", { category: "inverse" }, "BTC"],
+    ["future", { category: "linear", settleCoin: "USDT" }, "USDT"],
+    ["option", { category: "option", baseCoin: "BTC" }, "USDC"],
+  ];
+  const posLists = await Promise.all(posSpecs.map(([cat, params, ccy]) =>
+    bybitFetchList(acc, "/v5/position/list", params, 200)
+      .then(list => list.map(p => ({ cat, ccy, p }))).catch(() => [])));
+  acc.positions = posLists.flat()
+    .filter(({ p }) => p.side && p.side !== "None" && +p.size !== 0)
+    .map(({ cat, ccy, p }) => ({
+      key: ikey("bybit", cat, p.symbol), symbol: p.symbol, cat,
+      dirBuy: p.side === "Buy", size: Math.abs(+p.size),
+      entry: +p.avgPrice || null, mark: +p.markPrice || null,
+      liq: +p.liqPrice || null, upnl: +p.unrealisedPnl, upnlCcy: ccy,
+    }));
+
+  const ordSpecs = [
+    ["inverse", { category: "inverse" }],
+    ["future", { category: "linear", settleCoin: "USDT" }],
+    ["option", { category: "option", baseCoin: "BTC" }],
+    ["spot", { category: "spot" }],
+  ];
+  const ordLists = await Promise.all(ordSpecs.map(([cat, params]) =>
+    bybitFetchList(acc, "/v5/order/realtime", params, 50)
+      .then(list => list.map(o => ({ cat, o }))).catch(() => [])));
+  acc.orders = ordLists.flat().map(({ cat, o }) => ({
+    key: ikey("bybit", cat, o.symbol), symbol: o.symbol, cat,
+    dirBuy: o.side === "Buy", type: (o.orderType || "").toLowerCase(),
+    price: +o.price || null, amount: +o.qty, filled: +o.cumExecQty || 0,
+  }));
+
+  acc.equityParts = []; acc.mmPct = null;
+  try {
+    const w = await bybitFetch(acc, "/v5/account/wallet-balance", { accountType: "UNIFIED" });
+    const a = w.list && w.list[0];
+    if (a && +a.totalEquity > 0) {
+      acc.equityParts.push(`$${fmtP(+a.totalEquity)}`);
+      if (+a.totalMaintenanceMargin > 0) acc.mmPct = +a.totalMaintenanceMargin / +a.totalEquity * 100;
+    }
+  } catch {
+    try { // บัญชี classic (non-UTA)
+      const w = await bybitFetch(acc, "/v5/account/wallet-balance", { accountType: "CONTRACT" });
+      (w.list && w.list[0] && w.list[0].coin || []).forEach(c => {
+        if (+c.equity > 0) acc.equityParts.push(`${fmt(+c.equity)} ${c.coin}`);
+      });
+    } catch {}
+  }
+  acc.authed = true;
+  rebuildInstrumentSel();
+  renderAll();
+}
+
+/* ---------- phemex account (WS ล้วน: auth + AOP) ---------- */
+function startPhemexAccount(acc) {
+  acc.px = { pos: new Map(), ord: new Map(), bal: new Map() };
+  acc.conn = createWS({
+    url: PHEMEX_WS,
+    pingText: '{"id":9000,"method":"server.ping","params":[]}', pingSec: 15,
+    onOpen: async send => {
+      const expiry = Math.floor(Date.now() / 1000) + 120;
+      const sig = await hmacHex(acc.secret, acc.key + expiry);
+      send(JSON.stringify({ id: 1, method: "user.auth", params: ["API", acc.key, sig, expiry] }));
+    },
+    onMessage: (data, send) => {
+      const m = JSON.parse(data);
+      if (m.id === 1) { // ผล auth
+        if (m.error) { acc.error = "auth: " + (m.error.message || JSON.stringify(m.error)); acc.status = "err"; renderAll(); }
+        else {
+          acc.authed = true; acc.error = null;
+          send(JSON.stringify({ id: 2, method: "aop.subscribe", params: [] }));      // contract v1 (inverse, สเกลค่า)
+          send(JSON.stringify({ id: 3, method: "aop_p.subscribe", params: [] }));    // USDT-M (ค่าไม่สเกล)
+        }
+        return;
+      }
+      if (m.id === 3 && m.error) return; // บัญชีไม่มี USDT-M ก็ไม่เป็นไร
+      phemexApply(acc, m);
+    },
+    onStatus: accStatus(acc),
+  });
+}
+
+function phemexApply(acc, m) {
+  const hasV1 = m.positions || m.orders || m.accounts;
+  const hasP = m.positions_p || m.orders_p || m.accounts_p;
+  if (!hasV1 && !hasP) return;
+  const src = hasP ? "p" : "v1";
+  const S = acc.px;
+  if (m.type === "snapshot") { // ล้างเฉพาะข้อมูลของ stream ตัวเอง
+    [S.pos, S.ord, S.bal].forEach(map => {
+      [...map.keys()].forEach(k => { if (k.startsWith(src + ":")) map.delete(k); });
+    });
+  }
+  const OPEN = new Set(["New", "PartiallyFilled", "Untriggered", "Created"]);
+  (m.positions || m.positions_p || []).forEach(p => {
+    S.pos.set(`${src}:${p.symbol}:${p.posSide || ""}`, { src, p });
+  });
+  (m.orders || m.orders_p || []).forEach(o => {
+    const k = `${src}:${o.orderID || o.orderId}`;
+    if (OPEN.has(o.ordStatus)) S.ord.set(k, { src, o });
+    else S.ord.delete(k);
+  });
+  (m.accounts || m.accounts_p || []).forEach(a => {
+    S.bal.set(`${src}:${a.currency}`, { src, a });
+  });
+  phemexRebuild(acc);
+}
+
+function phemexRebuild(acc) {
+  const S = acc.px;
+  acc.positions = [...S.pos.values()].map(({ src, p }) => {
+    const scaled = src === "v1";
+    const side = p.side;
+    if (!side || side === "None") return null;
+    const size = Math.abs(+p.size || 0);
+    if (!size) return null;
+    const cvt = v => v == null ? null : (scaled ? +v / PHEMEX_SCALE_P : +v);
+    const entry = cvt(scaled ? p.avgEntryPriceEp : p.avgEntryPriceRp);
+    const mark = cvt(scaled ? (p.markPriceEp || p.markedPriceEp) : (p.markPriceRp || p.markedPriceRp));
+    const liq = cvt(scaled ? p.liquidationPriceEp : p.liquidationPriceRp);
+    const cat = phemexCat(p.symbol);
+    let upnl = null, ccy = "";
+    if (entry && mark) {
+      if (cat === "inverse") { // inverse: กำไรเป็น BTC
+        upnl = (side === "Buy" ? (1 / entry - 1 / mark) : (1 / mark - 1 / entry)) * size;
+        ccy = p.currency || "BTC";
+      } else {
+        upnl = (side === "Buy" ? (mark - entry) : (entry - mark)) * size;
+        ccy = "USDT";
+      }
+    }
+    return {
+      key: ikey("phemex", cat, p.symbol), symbol: p.symbol, cat,
+      dirBuy: side === "Buy", size, entry, mark, liq: liq || null, upnl, upnlCcy: ccy,
+    };
+  }).filter(Boolean);
+
+  acc.orders = [...S.ord.values()].map(({ src, o }) => {
+    const scaled = src === "v1";
+    const cat = phemexCat(o.symbol);
+    return {
+      key: ikey("phemex", cat, o.symbol), symbol: o.symbol, cat,
+      dirBuy: o.side === "Buy", type: (o.ordType || o.orderType || "limit").toLowerCase(),
+      price: scaled ? +o.priceEp / PHEMEX_SCALE_P : +(o.priceRp || o.price) || null,
+      amount: +o.orderQty, filled: +o.cumQty || 0,
+    };
+  });
+
+  acc.equityParts = [...S.bal.values()].map(({ src, a }) => {
+    const bal = src === "v1" ? +a.accountBalanceEv / PHEMEX_SCALE_V : +(a.accountBalanceRv || 0);
+    return bal > 0 ? `${fmt(bal)} ${a.currency}` : null;
+  }).filter(Boolean);
+  acc.mmPct = null;
+
+  rebuildInstrumentSel();
+  renderAll();
+}
+
+/* fallback: deribit/bybit refresh ทุก 30 วิ เผื่อ event หลุด (phemex เป็น push ล้วน) */
+setInterval(() => accounts.forEach(a => {
+  if (!a.authed) return;
+  if (a.exchange === "deribit") refreshDeribit(a).catch(() => {});
+  else if (a.exchange === "bybit") refreshBybit(a).catch(() => {});
+}), 30000);
+
+/* ================= instrument dropdown ================= */
+function dynamicOptions(ex) { // option instruments จาก position/order ที่มีจริง
+  const s = new Set();
+  accounts.filter(a => a.exchange === ex).forEach(a => {
+    [...a.positions, ...a.orders].forEach(x => { if (x.cat === "option") s.add(x.symbol); });
+  });
+  return [...s].sort();
+}
+
+function rebuildInstrumentSel() {
+  const sel = document.getElementById("instrumentSel");
+  const groups = [
+    ["Deribit · Future Inverse", "deribit", "inverse", deribitGroups.inverse],
+    ["Deribit · Future", "deribit", "future", deribitGroups.future],
+    ["Deribit · Option", "deribit", "option", dynamicOptions("deribit")],
+    ["Deribit · Spot", "deribit", "spot", deribitGroups.spot],
+    ["Bybit · Future Inverse", "bybit", "inverse", bybitGroups.inverse],
+    ["Bybit · Future", "bybit", "future", bybitGroups.future],
+    ["Bybit · Option", "bybit", "option", dynamicOptions("bybit")],
+    ["Bybit · Spot", "bybit", "spot", bybitGroups.spot],
+    ["Phemex · Future Inverse", "phemex", "inverse", [...new Set([...phemexGroups.inverse,
+      ...accounts.filter(a => a.exchange === "phemex").flatMap(a => [...a.positions, ...a.orders])
+        .filter(x => x.cat === "inverse").map(x => x.symbol)])]],
+    ["Phemex · Future", "phemex", "future", [...new Set([...phemexGroups.future,
+      ...accounts.filter(a => a.exchange === "phemex").flatMap(a => [...a.positions, ...a.orders])
+        .filter(x => x.cat === "future").map(x => x.symbol)])]],
+  ];
+  // instrument ปัจจุบันต้องอยู่ใน list เสมอ
+  const cur = iparse(instrument);
+  const hasCur = groups.some(([, ex, cat, list]) => ex === cur.ex && cat === cur.cat && list.includes(cur.sym));
+  if (!hasCur) {
+    const g = groups.find(([, ex, cat]) => ex === cur.ex && cat === cur.cat);
+    if (g) g[3].unshift(cur.sym);
+  }
+  sel.innerHTML = groups
+    .filter(([, , , list]) => list.length)
+    .map(([label, ex, cat, list]) =>
+      `<optgroup label="${label}">` +
+      list.map(sym => {
+        const k = ikey(ex, cat, sym);
+        return `<option value="${k}"${k === instrument ? " selected" : ""}>${sym}</option>`;
+      }).join("") + `</optgroup>`
+    ).join("");
+}
+
+/* ================= tabs ================= */
+function visibleAccounts() {
+  if (activeTab === "overview") return accounts;
+  const acc = accounts[parseInt(activeTab, 10)];
+  return acc ? [acc] : accounts;
+}
+const isOverview = () => activeTab === "overview" && accounts.length > 1;
+
+function renderTabs() {
+  const bar = document.getElementById("tabbar");
+  if (!accounts.length) { bar.innerHTML = ""; return; }
+  let html = "";
+  if (accounts.length > 1) {
+    html += `<div class="tab${activeTab === "overview" ? " active" : ""}" data-tab="overview">ภาพรวม</div>`;
+  }
+  html += accounts.map(a =>
+    `<div class="tab${activeTab === String(a.idx) ? " active" : ""}" data-tab="${a.idx}" title="${a.exchange}">
+       <span class="dot ${a.status}"></span>${a.name}</div>`
+  ).join("");
+  bar.innerHTML = html;
+}
+
+document.getElementById("tabbar").addEventListener("click", e => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  activeTab = tab.dataset.tab;
+  store.set("deribit_monitor_tab", activeTab);
+  renderAll();
+});
+
+/* ================= rendering ================= */
+function renderHeader() {
+  document.getElementById("lastPrice").textContent = lastPrice ? fmtP(lastPrice) : "–";
+  const el = document.getElementById("liqDistance");
+  let best = null;
+  visibleAccounts().forEach(a => a.positions.forEach(p => {
+    if (p.key !== instrument || !p.liq) return;
+    if (!best || Math.abs(p.liq - lastPrice) < Math.abs(best.liq - lastPrice)) {
+      best = { liq: p.liq, name: a.name };
+    }
+  }));
+  if (best && lastPrice) {
+    const dist = (best.liq - lastPrice) / lastPrice * 100;
+    const tag = isOverview() ? `[${best.name}] ` : "";
+    el.textContent = `${tag}LIQ ${fmtP(best.liq)} (${dist > 0 ? "+" : ""}${dist.toFixed(1)}%)`;
+    el.style.color = Math.abs(dist) < 10 ? "var(--liq)" : "var(--muted)";
+  } else {
+    el.textContent = "";
+  }
+}
+
+function renderLines() {
+  clearPriceLines();
+  const multi = isOverview();
+  visibleAccounts().forEach(a => {
+    const tag = multi ? `[${a.name}] ` : "";
+    a.positions.filter(p => p.key === instrument).forEach(pos => {
+      addLine(pos.entry, "#4a90d9",
+        `${tag}ENTRY ${pos.dirBuy ? "LONG" : "SHORT"} ${fmt(pos.size)}`,
+        LightweightCharts.LineStyle.Solid, 1);
+      addLine(pos.liq, "#ff3b5c", `${tag}LIQUIDATION`, LightweightCharts.LineStyle.Solid, 2);
+    });
+    a.orders.filter(o => o.key === instrument).forEach(o => {
+      addLine(o.price, o.dirBuy ? "#26a69a" : "#ff9f43",
+        `${tag}${o.dirBuy ? "BUY" : "SELL"} ${fmt(o.amount)}`,
+        LightweightCharts.LineStyle.Dashed, 1);
+    });
+  });
+}
+
+function posRowHtml(p) {
+  return `<div class="pos-row" data-inst="${p.key}">
+    <b>${p.symbol}</b>
+    <span class="${p.dirBuy ? "long" : "short"}">${p.dirBuy ? "LONG" : "SHORT"} ${fmt(p.size)}</span>
+    <span><span class="lbl">entry</span> ${fmtP(p.entry)}</span>
+    <span><span class="lbl">mark</span> ${fmtP(p.mark)}</span>
+    <span><span class="lbl">liq</span> <span class="liq-val">${p.liq ? fmtP(p.liq) : "–"}</span></span>
+    <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + p.upnlCcy : ""}</span></span>
+  </div>`;
+}
+
+function accBlockHtml(a) {
+  let html = `<div class="acc-block">`;
+  let mm = "";
+  if (a.mmPct != null) {
+    mm = `<span><span class="lbl">MM</span> <span style="color:${a.mmPct > 50 ? "var(--liq)" : "inherit"}">${a.mmPct.toFixed(1)}%</span></span>`;
+  }
+  html += `<div class="acc-head">
+    <b>${a.name}</b><span class="ex-tag">${a.exchange}</span>
+    ${a.equityParts.length ? `<span><span class="lbl">equity</span> ${a.equityParts.join(" · ")}</span>` : ""}
+    ${mm}
+    ${a.error ? `<span class="acc-err">⚠ ${a.error}</span>` : ""}
+  </div>`;
+
+  if (!a.positions.length) {
+    html += `<div class="empty">ไม่มี open position</div>`;
+  } else {
+    CAT_ORDER.forEach(cat => {
+      const list = a.positions.filter(p => p.cat === cat);
+      if (!list.length) return;
+      html += `<div class="cat-label">${CAT_LABEL[cat]}</div>`;
+      html += list.map(posRowHtml).join("");
+    });
+  }
+
+  if (a.orders.length) {
+    const catIdx = c => CAT_ORDER.indexOf(c);
+    const sorted = [...a.orders].sort((x, y) =>
+      catIdx(x.cat) - catIdx(y.cat) || x.symbol.localeCompare(y.symbol) || x.price - y.price);
+    html += `<table>
+      <tr><th>หมวด</th><th>Instrument</th><th>Side</th><th>Type</th><th>Price</th><th>Amount</th><th>Filled</th></tr>
+      ${sorted.map(o => `<tr data-inst="${o.key}">
+        <td>${CAT_LABEL[o.cat]}</td>
+        <td>${o.symbol}</td>
+        <td class="${o.dirBuy ? "long" : "short"}">${o.dirBuy ? "BUY" : "SELL"}</td>
+        <td>${o.type}</td>
+        <td>${fmtP(o.price)}</td>
+        <td>${fmt(o.amount)}</td>
+        <td>${fmt(o.filled)}</td>
+      </tr>`).join("")}
+    </table>`;
+  } else if (a.authed) {
+    html += `<div class="empty">ไม่มี open order</div>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+function renderPanels() {
+  const totalEl = document.getElementById("totalPanel");
+  const accEl = document.getElementById("accPanels");
+  if (!accounts.length) {
+    totalEl.innerHTML = "";
+    accEl.className = "empty";
+    accEl.textContent = "ยังไม่ได้ใส่ API key — เห็นแค่กราฟราคา (กด ⚙ ตั้งค่า)";
+    return;
+  }
+  if (isOverview()) {
+    // รวม equity ต่อสกุล/หน่วยจากทุกพอร์ท
+    const totals = new Map();
+    accounts.forEach(a => a.equityParts.forEach(part => {
+      const mDollar = part.match(/^\$([\d,.]+)$/);
+      const mCcy = part.match(/^([\d,.]+) (\w+)$/);
+      if (mDollar) totals.set("USD", (totals.get("USD") || 0) + parseFloat(mDollar[1].replace(/,/g, "")));
+      else if (mCcy) totals.set(mCcy[2], (totals.get(mCcy[2]) || 0) + parseFloat(mCcy[1].replace(/,/g, "")));
+    }));
+    const parts = [...totals.entries()].map(([ccy, v]) => ccy === "USD" ? `$${fmtP(v)}` : `${fmt(v)} ${ccy}`);
+    totalEl.innerHTML = parts.length
+      ? `<div class="total-row"><span><span class="lbl">equity รวมทุกพอร์ท</span> <b>${parts.join(" · ")}</b></span></div>`
+      : "";
+  } else {
+    totalEl.innerHTML = "";
+  }
+  accEl.className = "";
+  accEl.innerHTML = visibleAccounts().map(accBlockHtml).join("");
+}
+
+function renderTf(ex) {
+  const tfGroup = document.getElementById("tfGroup");
+  tfGroup.innerHTML = TF_LABELS[ex].map(l =>
+    `<button data-tf="${l}"${l === tfLabel ? ' class="active"' : ""}>${l}</button>`).join("");
+}
+
+function renderAll() { renderTabs(); renderLines(); renderPanels(); renderHeader(); }
+
+/* ================= UI events ================= */
+document.getElementById("tfGroup").addEventListener("click", e => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  tfLabel = btn.dataset.tf;
+  store.set("deribit_monitor_tf", tfLabel);
+  loadChart().catch(console.error);
+});
+
+document.getElementById("instrumentSel").addEventListener("change", e => {
+  instrument = e.target.value;
+  store.set("deribit_monitor_instrument", instrument);
+  loadChart().catch(console.error);
+});
+
+document.querySelector("footer").addEventListener("click", e => {
+  const row = e.target.closest("[data-inst]");
+  if (!row) return;
+  instrument = row.dataset.inst;
+  store.set("deribit_monitor_instrument", instrument);
+  rebuildInstrumentSel();
+  loadChart().catch(console.error);
+});
+
+/* ================= settings modal ================= */
+const modal = document.getElementById("modal");
+const accList = document.getElementById("accList");
+
+function accEditRow(a) {
+  const div = document.createElement("div");
+  div.className = "acc-edit-row";
+  div.innerHTML = `
+    <select class="e-ex">${EXCHANGES.map(x =>
+      `<option value="${x}"${a && a.exchange === x ? " selected" : ""}>${x}</option>`).join("")}</select>
+    <input type="text" class="e-name" placeholder="เช่น Main" value="${a?.name || ""}">
+    <input type="text" class="e-id" autocomplete="off" value="${a?.clientId || ""}">
+    <input type="password" class="e-secret" autocomplete="off" value="${a?.clientSecret || ""}">
+    <button class="btn-x" title="ลบพอร์ทนี้">✕</button>`;
+  div.querySelector(".btn-x").onclick = () => div.remove();
+  return div;
+}
+
+document.getElementById("btnSettings").onclick = () => {
+  accList.innerHTML = "";
+  (cfg.accounts.length ? cfg.accounts : [null]).forEach(a => accList.appendChild(accEditRow(a)));
+  document.getElementById("inTestnet").checked = !!cfg.testnet;
+  modal.classList.add("show");
+};
+document.getElementById("btnAddAcc").onclick = () => accList.appendChild(accEditRow(null));
+document.getElementById("btnCancel").onclick = () => modal.classList.remove("show");
+document.getElementById("btnSave").onclick = () => {
+  const rows = [...accList.querySelectorAll(".acc-edit-row")];
+  const accs = rows.map((r, i) => ({
+    exchange: r.querySelector(".e-ex").value,
+    name: r.querySelector(".e-name").value.trim() || `Port ${i + 1}`,
+    clientId: r.querySelector(".e-id").value.trim(),
+    clientSecret: r.querySelector(".e-secret").value.trim(),
+  })).filter(a => a.clientId && a.clientSecret);
+  cfg = { accounts: accs, testnet: document.getElementById("inTestnet").checked };
+  store.set(LS_KEY, JSON.stringify(cfg));
+  modal.classList.remove("show");
+  restartAll();
+};
+
+/* ================= lifecycle ================= */
+function stopAll() {
+  if (chartSrc) { chartSrc.stop(); chartSrc = null; }
+  if (pub) pub.close();
+  accounts.forEach(a => {
+    if (a.conn) a.conn.close();
+    clearTimeout(a.authTimer);
+  });
+}
+
+function boot() {
+  buildAccounts();
+  if (activeTab !== "overview" && !accounts[parseInt(activeTab, 10)]) activeTab = "overview";
+  if (accounts.length === 1) activeTab = "0";
+  renderAll();
+  renderTf(iparse(instrument).ex);
+  startPublic();               // deribit public: instruments + กราฟ deribit
+  loadBybitInstruments();      // ไม่ต้องมี key
+  if (iparse(instrument).ex !== "deribit") loadChart().catch(console.error);
+  accounts.forEach(startAccount);
+}
+
+function restartAll() { stopAll(); boot(); }
+
+if (!cfg.accounts.length) {
+  accList.appendChild(accEditRow(null));
+  modal.classList.add("show");
+}
+boot();
+</script>
+</body>
+</html>
