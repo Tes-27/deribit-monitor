@@ -328,14 +328,14 @@ const FUT_FORM = (p) => `
         <div class="hint" id="${p}-contracts"></div>
       </div>
       <div>
-        <label>Equity ปัจจุบัน (BTC)</label>
-        <input type="number" id="${p}-equity" value="0.02" step="0.001">
-        <div class="hint">จากหน้า Deribit (รวม unrealized แล้ว) — <b>ตัวนี้ใช้คำนวณ liq</b></div>
-      </div>
-      <div>
         <label>Balance (BTC) — ไม่บังคับ</label>
         <input type="number" id="${p}-balance" step="0.001" placeholder="เช่น 0.0389">
         <div class="hint">cash balance (ไม่รวม unrealized) — ใช้เทียบ PnL หรือ derive equity ถ้าเว้น equity ว่าง</div>
+      </div>
+      <div>
+        <label>Equity ปัจจุบัน (BTC)</label>
+        <input type="number" id="${p}-equity" value="0.02" step="0.001">
+        <div class="hint">จากหน้า Deribit (รวม unrealized แล้ว) — <b>ตัวนี้ใช้คำนวณ liq</b></div>
       </div>
     </div>
     <div class="chkrow">
