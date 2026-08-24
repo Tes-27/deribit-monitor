@@ -265,13 +265,15 @@ function black76Usd(F, K, T, sigma, isCall) {
 const markBtc = (F, K, T, sigma, isCall) => black76Usd(F, K, T, sigma, isCall) / F;
 
 /* ---------- แถบภาพระยะห่างราคา ---------- */
-function priceBar(entry, liq, dir) {
+function priceBar(entry, liq, dir, mark) {
   if (!isFinite(liq)) return "";
-  const lo = Math.min(entry, liq), hi = Math.max(entry, liq);
+  const pts = [entry, liq].concat(isFinite(mark) ? [mark] : []);
+  const lo = Math.min(...pts), hi = Math.max(...pts);
   const pad = (hi - lo) * 0.35 || entry * 0.05;
   const min = Math.max(0, lo - pad), max = hi + pad;
   const pos = p => ((p - min) / (max - min) * 100).toFixed(2) + "%";
-  const zoneStyle = liq < entry
+  const ref = isFinite(mark) ? mark : entry;
+  const zoneStyle = liq < ref
     ? `left:0; width:${pos(liq)};`
     : `left:${pos(liq)}; right:0;`;
   return `
@@ -281,6 +283,10 @@ function priceBar(entry, liq, dir) {
         <div class="bar-marker" style="left:${pos(liq)}; background:var(--red);">
           <span class="tag" style="background:var(--red); color:#fff;">LIQ ${fmtUsd(liq)}</span>
         </div>
+        ${isFinite(mark) ? `
+        <div class="bar-marker" style="left:${pos(mark)}; background:var(--blue);">
+          <span class="tag" style="background:var(--blue); color:#fff;">MARK ${fmtUsd(mark)}</span>
+        </div>` : ""}
         <div class="bar-marker" style="left:${pos(entry)}; background:var(--text); bottom:0; top:auto; height:100%;">
           <span class="tag" style="background:var(--panel2); color:var(--text); top:auto; bottom:2px;">${dir} ${fmtUsd(entry)}</span>
         </div>
@@ -307,8 +313,14 @@ const FUT_FORM = (p) => `
         </select>
       </div>
       <div>
-        <label>Entry Price (USD)</label>
+        <label>Avg Entry Price (USD)</label>
         <input type="number" id="${p}-entry" value="115000" step="100">
+        <div class="hint">ราคาเฉลี่ยหลังเพิ่ม/ลด position (ใช้แสดง PnL)</div>
+      </div>
+      <div>
+        <label>Mark Price ปัจจุบัน (USD)</label>
+        <input type="number" id="${p}-mark" value="115000" step="100">
+        <div class="hint">กดปุ่มดึงราคาด้านบนเพื่อเติมอัตโนมัติ</div>
       </div>
       <div>
         <label>ขนาด position (USD)</label>
@@ -316,9 +328,9 @@ const FUT_FORM = (p) => `
         <div class="hint" id="${p}-contracts"></div>
       </div>
       <div>
-        <label>Margin / Equity (BTC)</label>
+        <label>Equity ปัจจุบัน (BTC)</label>
         <input type="number" id="${p}-equity" value="0.02" step="0.001">
-        <div class="hint">isolated: margin ของ position นี้ · cross: equity ทั้งบัญชี</div>
+        <div class="hint">ตัวเลข equity จากหน้า Deribit (รวม unrealized PnL แล้ว)</div>
       </div>
     </div>
     <div class="chkrow">
@@ -328,15 +340,17 @@ const FUT_FORM = (p) => `
       <span style="font-size:.75rem;">(ปกติปล่อยว่าง = สูตร Deribit 1% + 0.5%/100BTC)</span>
     </div>
     <div class="results" id="${p}-results"></div>
-    <div class="formula">Inverse: PnL(BTC) = ±N × (1/P_entry − 1/P)
+    <div class="formula">Inverse: PnL(BTC) จาก mark ถึง P = ±N × (1/P_mark − 1/P)
 MM rate = 1% + 0.5% × (ขนาด position เป็น BTC / 100)   |   IM rate = 2% + ส่วนเพิ่มเดียวกัน
-จุด liquidation: หา P ที่  equity + PnL(P)  =  MM_rate(P) × N / P</div>`;
+จุด liquidation: หา P ที่  equity_ปัจจุบัน + PnL(P)  =  MM_rate(P) × N / P
+(equity รวม unrealized แล้ว จึงอ้างอิงจาก mark — avg entry ใช้แสดง PnL เท่านั้น)</div>`;
 
 function calcFut(p) {
   const dir = document.getElementById(p + "-dir").value;
-  const P0 = num(document.getElementById(p + "-entry"));
+  const P0 = num(document.getElementById(p + "-entry"));   /* avg entry — ใช้แสดง PnL */
+  const M = num(document.getElementById(p + "-mark"));     /* mark ปัจจุบัน — ฐานคำนวณ liq */
   const N = num(document.getElementById(p + "-notional"));
-  const E = num(document.getElementById(p + "-equity"));
+  const E = num(document.getElementById(p + "-equity"));   /* equity ณ mark (รวม unrealized) */
   const useCustom = document.getElementById(p + "-custommm").checked;
   const mmCustom = num(document.getElementById(p + "-mmval")) / 100;
   const out = document.getElementById(p + "-results");
@@ -344,51 +358,54 @@ function calcFut(p) {
   document.getElementById(p + "-contracts").textContent =
     isFinite(N) ? "= " + fmtUsd(N / 10) + " สัญญา (สัญญาละ $10)" : "";
 
-  if (!(P0 > 0 && N > 0 && E > 0)) { out.innerHTML = '<div class="err">กรอก entry price, ขนาด position และ margin ให้ครบ (ต้องมากกว่า 0)</div>'; return; }
+  if (!(M > 0 && N > 0 && E > 0)) { out.innerHTML = '<div class="err">กรอก mark price, ขนาด position และ equity ให้ครบ (ต้องมากกว่า 0)</div>'; return; }
+  const hasEntry = P0 > 0;
 
-  const sizeBtc0 = N / P0;
+  const sizeBtc = N / M;
   const mmRate = P => useCustom && isFinite(mmCustom) ? mmCustom : 0.01 + 0.00005 * (N / P);
-  const imRate0 = 0.02 + 0.00005 * sizeBtc0;
-  const equityAt = P => dir === "long" ? E + N / P0 - N / P : E + N / P - N / P0;
+  const imRate = 0.02 + 0.00005 * sizeBtc;
+  const equityAt = P => dir === "long" ? E + N / M - N / P : E + N / P - N / M;
   const f = P => equityAt(P) - mmRate(P) * N / P;
 
   let liq = NaN, noLiq = false, already = false;
-  if (f(P0) <= 0) {
+  if (f(M) <= 0) {
     already = true;
   } else if (dir === "long") {
-    liq = bisect(f, P0 * 1e-6, P0);
+    liq = bisect(f, M * 1e-6, M);
   } else {
-    if (E >= N / P0) { noLiq = true; }        /* short inverse ที่ margin ≥ N/P₀ ราคาขึ้นแค่ไหนก็ไม่โดน */
+    if (E >= N / M) { noLiq = true; }        /* short inverse ที่ equity ≥ ขนาด position เป็น BTC ราคาขึ้นแค่ไหนก็ไม่โดน */
     else {
-      let hi = P0;
+      let hi = M;
       for (let i = 0; i < 60 && f(hi) > 0; i++) hi *= 2;
-      liq = bisect(f, P0, hi);
+      liq = bisect(f, M, hi);
     }
   }
 
-  const lev = sizeBtc0 / E;
-  const im0 = imRate0 * sizeBtc0, mm0 = mmRate(P0) * sizeBtc0;
-  const dist = isFinite(liq) ? Math.abs(liq - P0) / P0 : NaN;
+  const uPnl = hasEntry ? (dir === "long" ? N * (1 / P0 - 1 / M) : N * (1 / M - 1 / P0)) : NaN;
+  const lev = sizeBtc / E;
+  const im = imRate * sizeBtc, mm = mmRate(M) * sizeBtc;
+  const dist = isFinite(liq) ? Math.abs(liq - M) / M : NaN;
 
   let head;
   if (already) {
-    head = '<div class="liq-big danger"><div><div class="lab">สถานะ</div><div class="val" style="font-size:1.1rem;">⚠ equity ต่ำกว่า MM แล้ว — position นี้อยู่ในเขต liquidation ตั้งแต่เข้า</div></div></div>';
+    head = '<div class="liq-big danger"><div><div class="lab">สถานะ</div><div class="val" style="font-size:1.1rem;">⚠ equity ต่ำกว่า MM แล้ว — position นี้อยู่ในเขต liquidation ณ mark ปัจจุบัน</div></div></div>';
   } else if (noLiq) {
-    head = '<div class="liq-big safe"><div><div class="lab">จุด Liquidation</div><div class="val">ไม่มี — margin (BTC) ≥ ขนาด position เป็น BTC แล้ว short inverse ไม่มีวันโดนบังคับปิด</div></div></div>';
+    head = '<div class="liq-big safe"><div><div class="lab">จุด Liquidation</div><div class="val">ไม่มี — equity (BTC) ≥ ขนาด position เป็น BTC แล้ว short inverse ไม่มีวันโดนบังคับปิด</div></div></div>';
   } else {
     head = `<div class="liq-big">
       <div><div class="lab">จุด Liquidation โดยประมาณ</div><div class="val">$${fmtUsd(liq)}</div></div>
-      <div class="dist">ห่างจาก entry price ${fmtPct(dist)}<br>(${dir === "long" ? "ราคาลง" : "ราคาขึ้น"}ไปถึงจึงโดน)</div>
-    </div>` + priceBar(P0, liq, dir === "long" ? "LONG" : "SHORT");
+      <div class="dist">ห่างจาก mark ${fmtPct(dist)}<br>(${dir === "long" ? "ราคาลง" : "ราคาขึ้น"}ไปถึงจึงโดน)</div>
+    </div>` + priceBar(hasEntry ? P0 : M, liq, dir === "long" ? "LONG" : "SHORT", M);
   }
 
   out.innerHTML = head + `
     <table class="detail">
-      <tr><td>ขนาด position</td><td>${fmtBtc(sizeBtc0)} <span class="u">BTC</span> ($${fmtUsd(N)})</td></tr>
+      <tr><td>ขนาด position ณ mark</td><td>${fmtBtc(sizeBtc)} <span class="u">BTC</span> ($${fmtUsd(N)})</td></tr>
+      ${hasEntry ? `<tr><td>Unrealized PnL (avg entry → mark)</td><td>${uPnl >= 0 ? "+" : ""}${fmtBtc(uPnl)} <span class="u">BTC</span> ≈ ${uPnl >= 0 ? "+" : ""}$${fmtUsd2(uPnl * M)}</td></tr>` : ""}
       <tr><td>Leverage ที่ใช้จริง (ต่อ equity)</td><td>${lev.toLocaleString("en-US", {maximumFractionDigits: 2})}x</td></tr>
-      <tr><td>Initial Margin (${fmtPct(imRate0)})</td><td>${fmtBtc(im0)} <span class="u">BTC</span></td></tr>
-      <tr><td>Maintenance Margin ณ entry price (${fmtPct(mmRate(P0))})</td><td>${fmtBtc(mm0)} <span class="u">BTC</span></td></tr>
-      <tr><td>Buffer เหนือ MM ตอนนี้</td><td>${fmtBtc(E - mm0)} <span class="u">BTC</span></td></tr>
+      <tr><td>Initial Margin (${fmtPct(imRate)})</td><td>${fmtBtc(im)} <span class="u">BTC</span></td></tr>
+      <tr><td>Maintenance Margin ณ mark (${fmtPct(mmRate(M))})</td><td>${fmtBtc(mm)} <span class="u">BTC</span></td></tr>
+      <tr><td>Buffer เหนือ MM ตอนนี้</td><td>${fmtBtc(E - mm)} <span class="u">BTC</span></td></tr>
       ${isFinite(liq) ? `<tr class="hl"><td>MM rate ณ จุด liquidation</td><td>${fmtPct(mmRate(liq))}</td></tr>` : ""}
     </table>
     <div class="warn">⚠ ค่าโดยประมาณ: Deribit liquidate แบบ incremental (ทยอยลดขนาด position) และเช็กกับ mark price ไม่ใช่ last price${p === "perp" ? " · funding fee ที่จ่าย/รับจะขยับ equity และจุด liquidation จริงตลอดเวลา" : " · future มี basis — mark ของสัญญาอาจต่างจาก index หลายร้อยดอลลาร์"}</div>`;
@@ -434,7 +451,7 @@ function initFutFetch(p) {
       setStatus(status, "กำลังดึงราคา…");
       try {
         const t = await deribitGet("/public/ticker", {instrument_name: "BTC-PERPETUAL"});
-        document.getElementById(p + "-entry").value = t.mark_price;
+        document.getElementById(p + "-mark").value = t.mark_price;
         setStatus(status, `mark $${fmtUsd2(t.mark_price)} · index $${fmtUsd2(t.index_price)} · ${timeNow()}`, "ok");
         calcFut(p);
       } catch (e) {
@@ -468,7 +485,7 @@ function initFutFetch(p) {
     setStatus(status, "กำลังดึงราคา " + sel.value + "…");
     try {
       const t = await deribitGet("/public/ticker", {instrument_name: sel.value});
-      document.getElementById(p + "-entry").value = t.mark_price;
+      document.getElementById(p + "-mark").value = t.mark_price;
       const basis = t.mark_price - t.index_price;
       setStatus(status, `${sel.value}: mark $${fmtUsd2(t.mark_price)} · basis ${basis >= 0 ? "+" : ""}${fmtUsd2(basis)} · ${timeNow()}`, "ok");
       calcFut(p);
