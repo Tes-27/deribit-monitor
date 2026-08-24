@@ -330,7 +330,12 @@ const FUT_FORM = (p) => `
       <div>
         <label>Equity ปัจจุบัน (BTC)</label>
         <input type="number" id="${p}-equity" value="0.02" step="0.001">
-        <div class="hint">ตัวเลข equity จากหน้า Deribit (รวม unrealized PnL แล้ว)</div>
+        <div class="hint">จากหน้า Deribit (รวม unrealized แล้ว) — <b>ตัวนี้ใช้คำนวณ liq</b></div>
+      </div>
+      <div>
+        <label>Balance (BTC) — ไม่บังคับ</label>
+        <input type="number" id="${p}-balance" step="0.001" placeholder="เช่น 0.0389">
+        <div class="hint">cash balance (ไม่รวม unrealized) — ใช้เทียบ PnL หรือ derive equity ถ้าเว้น equity ว่าง</div>
       </div>
     </div>
     <div class="chkrow">
@@ -350,7 +355,8 @@ function calcFut(p) {
   const P0 = num(document.getElementById(p + "-entry"));   /* avg entry — ใช้แสดง PnL */
   const M = num(document.getElementById(p + "-mark"));     /* mark ปัจจุบัน — ฐานคำนวณ liq */
   const N = num(document.getElementById(p + "-notional"));
-  const E = num(document.getElementById(p + "-equity"));   /* equity ณ mark (รวม unrealized) */
+  const eqIn = num(document.getElementById(p + "-equity"));
+  const bal = num(document.getElementById(p + "-balance"));
   const useCustom = document.getElementById(p + "-custommm").checked;
   const mmCustom = num(document.getElementById(p + "-mmval")) / 100;
   const out = document.getElementById(p + "-results");
@@ -358,8 +364,24 @@ function calcFut(p) {
   document.getElementById(p + "-contracts").textContent =
     isFinite(N) ? "= " + fmtUsd(N / 10) + " สัญญา (สัญญาละ $10)" : "";
 
-  if (!(M > 0 && N > 0 && E > 0)) { out.innerHTML = '<div class="err">กรอก mark price, ขนาด position และ equity ให้ครบ (ต้องมากกว่า 0)</div>'; return; }
+  if (!(M > 0 && N > 0)) { out.innerHTML = '<div class="err">กรอก mark price และขนาด position ให้ครบ (ต้องมากกว่า 0)</div>'; return; }
   const hasEntry = P0 > 0;
+
+  /* equity ณ mark (รวม unrealized) — ตัวที่ใช้คำนวณ liq */
+  let E, eqSource = "", eqDerived = false;
+  const pnlEntryToMark = hasEntry ? (dir === "long" ? N * (1 / P0 - 1 / M) : N * (1 / M - 1 / P0)) : NaN;
+  if (eqIn > 0) {
+    E = eqIn;
+    eqSource = "กรอกเอง";
+  } else if (isFinite(bal) && bal > 0 && hasEntry) {
+    E = bal + pnlEntryToMark;
+    eqSource = "derive = balance + PnL(avg entry → mark)";
+    eqDerived = true;
+  }
+  if (!(E > 0)) {
+    out.innerHTML = '<div class="err">กรอก equity — หรือถ้าจะให้ derive จาก balance ต้องกรอกทั้ง balance และ avg entry price (และผลรวมต้องมากกว่า 0)</div>';
+    return;
+  }
 
   const sizeBtc = N / M;
   const mmRate = P => useCustom && isFinite(mmCustom) ? mmCustom : 0.01 + 0.00005 * (N / P);
@@ -381,7 +403,9 @@ function calcFut(p) {
     }
   }
 
-  const uPnl = hasEntry ? (dir === "long" ? N * (1 / P0 - 1 / M) : N * (1 / M - 1 / P0)) : NaN;
+  const uPnl = pnlEntryToMark;
+  const uPnlDeribit = (eqIn > 0 && isFinite(bal) && bal > 0) ? eqIn - bal : NaN;   /* uPnL ตั้งแต่ settlement ล่าสุด */
+  const settled = (isFinite(uPnlDeribit) && hasEntry) ? uPnl - uPnlDeribit : NaN;  /* ส่วนที่ settle เข้า balance แล้ว */
   const lev = sizeBtc / E;
   const im = imRate * sizeBtc, mm = mmRate(M) * sizeBtc;
   const dist = isFinite(liq) ? Math.abs(liq - M) / M : NaN;
@@ -401,13 +425,17 @@ function calcFut(p) {
   out.innerHTML = head + `
     <table class="detail">
       <tr><td>ขนาด position ณ mark</td><td>${fmtBtc(sizeBtc)} <span class="u">BTC</span> ($${fmtUsd(N)})</td></tr>
-      ${hasEntry ? `<tr><td>Unrealized PnL (avg entry → mark)</td><td>${uPnl >= 0 ? "+" : ""}${fmtBtc(uPnl)} <span class="u">BTC</span> ≈ ${uPnl >= 0 ? "+" : ""}$${fmtUsd2(uPnl * M)}</td></tr>` : ""}
+      <tr><td>Equity ที่ใช้คำนวณ</td><td>${fmtBtc(E)} <span class="u">BTC (${eqSource})</span></td></tr>
+      ${hasEntry ? `<tr><td>PnL รวมจาก avg entry → mark</td><td>${uPnl >= 0 ? "+" : ""}${fmtBtc(uPnl)} <span class="u">BTC</span> ≈ ${uPnl >= 0 ? "+" : ""}$${fmtUsd2(uPnl * M)}</td></tr>` : ""}
+      ${isFinite(uPnlDeribit) ? `<tr><td>uPnL ตาม Deribit (equity − balance)</td><td>${uPnlDeribit >= 0 ? "+" : ""}${fmtBtc(uPnlDeribit)} <span class="u">BTC (นับจาก settlement ล่าสุด)</span></td></tr>` : ""}
+      ${isFinite(settled) ? `<tr><td>PnL ที่ settle เข้า balance ไปแล้ว</td><td>${settled >= 0 ? "+" : ""}${fmtBtc(settled)} <span class="u">BTC</span></td></tr>` : ""}
       <tr><td>Leverage ที่ใช้จริง (ต่อ equity)</td><td>${lev.toLocaleString("en-US", {maximumFractionDigits: 2})}x</td></tr>
       <tr><td>Initial Margin (${fmtPct(imRate)})</td><td>${fmtBtc(im)} <span class="u">BTC</span></td></tr>
       <tr><td>Maintenance Margin ณ mark (${fmtPct(mmRate(M))})</td><td>${fmtBtc(mm)} <span class="u">BTC</span></td></tr>
       <tr><td>Buffer เหนือ MM ตอนนี้</td><td>${fmtBtc(E - mm)} <span class="u">BTC</span></td></tr>
       ${isFinite(liq) ? `<tr class="hl"><td>MM rate ณ จุด liquidation</td><td>${fmtPct(mmRate(liq))}</td></tr>` : ""}
     </table>
+    ${eqDerived ? `<div class="warn">⚠ Equity ถูก derive จาก balance + PnL นับจาก avg entry — <b>ถ้า position นี้ผ่าน daily settlement (08:00 UTC) มาแล้ว ค่านี้จะนับ PnL ซ้ำและสูง/ต่ำกว่าจริง</b> เพราะ balance ของ Deribit มี PnL ที่ settle แล้วรวมอยู่ แนะนำกรอก Equity จากหน้า Deribit ตรง ๆ จะแม่นที่สุด</div>` : ""}
     <div class="warn">⚠ ค่าโดยประมาณ: Deribit liquidate แบบ incremental (ทยอยลดขนาด position) และเช็กกับ mark price ไม่ใช่ last price${p === "perp" ? " · funding fee ที่จ่าย/รับจะขยับ equity และจุด liquidation จริงตลอดเวลา" : " · future มี basis — mark ของสัญญาอาจต่างจาก index หลายร้อยดอลลาร์"}</div>`;
 }
 
