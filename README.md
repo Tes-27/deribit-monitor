@@ -3,6 +3,13 @@
 หน้าจอ monitor แบบ **read-only** สำหรับดู position, limit order และ **liquidation price** ทับกราฟแท่งเทียน
 เป็น **HTML ไฟล์เดียว ไม่มี backend** — เปิดไฟล์ใน browser แล้วใช้ได้เลย (ต้องต่ออินเทอร์เน็ต)
 
+ในโฟลเดอร์นี้มี 2 เครื่องมือ:
+
+| ไฟล์ | คืออะไร |
+|---|---|
+| `index.html` | Position monitor (ต้องใช้ API key แบบ read-only) |
+| `liq-calculator.html` | **Liquidation calculator** — คำนวณจุด liquidation ของ Deribit (BTC) แบบ Future / Inverse Perpetual / Option ไม่ต้องใช้ API key มีปุ่มดึง mark price / option chain จาก Deribit public API |
+
 สร้างขึ้นเพราะหน้ากราฟของ Deribit เวอร์ชันใหม่ไม่แสดงเส้น liquidation แล้ว
 
 ## ฟีเจอร์
