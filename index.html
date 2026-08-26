@@ -948,6 +948,18 @@ function phemexApply(acc, m) {
   phemexRebuild(acc);
 }
 
+// สูตร cross/isolated เดียวกับที่ใช้ตรวจกับ Deribit — margin อ้างอิงที่ entry (ไม่รวม uPnL)
+function liqEstFromMargin(inv, dirBuy, sz, entry, margin, r) {
+  if (!sz || !entry || !(margin > 0)) return null;
+  if (inv) {
+    if (dirBuy) { const den = margin + sz / entry; return den > 0 ? sz * (1 + r) / den : null; }
+    const den = sz / entry - margin;
+    return den > 0 ? sz * (1 - r) / den : null;
+  }
+  if (dirBuy) { const num = sz * entry - margin; return num > 0 ? num / (sz * (1 - r)) : null; }
+  return (sz * entry + margin) / (sz * (1 + r));
+}
+
 function phemexRebuild(acc) {
   const S = acc.px;
   acc.positions = [...S.pos.values()].map(({ src, p }) => {
@@ -971,9 +983,33 @@ function phemexRebuild(acc) {
         ccy = "USDT";
       }
     }
+
+    // ตรวจสูตร: คำนวณ liq เองจาก maintMarginReq + margin ของ position เทียบกับค่าที่ API ให้
+    let liqChk = null;
+    if (liq && entry) {
+      const r = scaled
+        ? (+(p.maintMarginReqEr ?? p.maintenanceMarginReqEr) || 0) / PHEMEX_SCALE_V
+        : parseFloat(p.maintMarginReqRr ?? p.maintMarginReq ?? "") || 0;
+      const isCross = p.crossMargin === true || +(p.leverageEr ?? p.leverageRr ?? 1) === 0;
+      let margin = scaled
+        ? (+(p.assignedPosBalanceEv ?? p.positionMarginEv ?? p.usedBalanceEv) || 0) / PHEMEX_SCALE_V
+        : parseFloat(p.assignedPosBalanceRv ?? p.positionMarginRv ?? p.usedBalanceRv ?? "") || 0;
+      if (isCross) { // cross: ใช้ balance ทั้งบัญชีของสกุลนั้นแทน margin เฉพาะไม้
+        const bal = S.bal.get(`${src}:${cat === "inverse" ? (p.currency || "BTC") : "USDT"}`);
+        if (bal) margin = scaled ? +bal.a.accountBalanceEv / PHEMEX_SCALE_V : +(bal.a.accountBalanceRv || 0);
+      }
+      if (r > 0 && margin > 0) {
+        const fee = cat === "inverse" ? 0.00075 : 0.0006; // taker fee โดยประมาณ (ค่าปิด position)
+        const est = liqEstFromMargin(cat === "inverse", side === "Buy", size, entry, margin, r);
+        const estFee = liqEstFromMargin(cat === "inverse", side === "Buy", size, entry, margin, r + fee);
+        if (est) liqChk = { est, estFee, diffPct: (est - liq) / liq * 100 };
+      }
+      console.debug("phemex liq check", p.symbol, { apiLiq: liq, liqChk, rawPos: p });
+    }
+
     return {
       key: ikey("phemex", cat, p.symbol), symbol: p.symbol, cat,
-      dirBuy: side === "Buy", size, entry, mark, liq: liq || null, upnl, upnlCcy: ccy,
+      dirBuy: side === "Buy", size, entry, mark, liq: liq || null, upnl, upnlCcy: ccy, liqChk,
     };
   }).filter(Boolean);
 
@@ -1126,7 +1162,7 @@ function posRowHtml(p) {
     <span class="${p.dirBuy ? "long" : "short"}">${p.dirBuy ? "LONG" : "SHORT"} ${fmt(p.size)}</span>
     <span><span class="lbl">entry</span> ${fmtP(p.entry)}</span>
     <span><span class="lbl">mark</span> ${fmtP(p.mark)}</span>
-    <span><span class="lbl">liq</span> <span class="liq-val" ${p.liqEst ? 'title="คำนวณเองจาก equity+MM (Deribit เลิกส่งค่านี้ใน API)"' : ""}>${p.liq ? (p.liqEst ? "≈" : "") + fmtP(p.liq) : "–"}</span></span>
+    <span><span class="lbl">liq</span> <span class="liq-val" ${p.liqEst ? 'title="คำนวณเองจาก equity+MM (Deribit เลิกส่งค่านี้ใน API)"' : ""}>${p.liq ? (p.liqEst ? "≈" : "") + fmtP(p.liq) : "–"}</span>${p.liqChk ? ` <span class="lbl" title="ตรวจสูตร — API ให้ ${fmtP(p.liq)} · สูตรเรา ≈${fmtP(p.liqChk.est)} · ถ้ารวมค่า fee ปิด ≈${fmtP(p.liqChk.estFee)}">(สูตรเรา ≈${fmtP(p.liqChk.est)} · Δ${p.liqChk.diffPct >= 0 ? "+" : ""}${p.liqChk.diffPct.toFixed(2)}%)</span>` : ""}</span>
     <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + esc(p.upnlCcy) : ""}</span></span>
   </div>`;
 }
