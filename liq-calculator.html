@@ -108,6 +108,19 @@
   .fetch-status.ok { color: var(--green); }
   .fetch-status.err { color: var(--red); }
 
+  .adds-box { border: 1px dashed var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; }
+  .adds-title { font-size: .85rem; color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+  .adds-title .hint-inline { color: var(--muted); font-weight: normal; font-size: .74rem; }
+  .add-row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  .add-row .add-lab { font-size: .8rem; color: var(--muted); min-width: 38px; }
+  .add-row input { width: 160px; }
+  .add-row .add-del {
+    background: none; border: 1px solid var(--border); color: var(--red);
+    border-radius: 6px; cursor: pointer; padding: 6px 11px; font-size: .85rem;
+  }
+  .liq-big.adds .val { color: var(--accent); }
+  .liq-big.adds { border-color: var(--accent); }
+
   .warn { color: var(--yellow); font-size: .8rem; margin-top: 10px; line-height: 1.5; }
   .err { color: var(--red); font-size: .85rem; padding: 10px 0; }
   .formula {
@@ -344,6 +357,11 @@ const FUT_FORM = (p) => `
       <input type="number" id="${p}-mmval" value="1.0" step="0.05" disabled> %
       <span style="font-size:.75rem;">(ปกติปล่อยว่าง = สูตร Deribit 1% + 0.5%/100BTC)</span>
     </div>
+    <div class="adds-box">
+      <div class="adds-title">➕ ไม้เพิ่ม (what-if) <span class="hint-inline">— ใส่ราคา+ขนาดของไม้ที่วางแผนจะเพิ่ม (ทิศทางเดียวกับ position) แล้วดู avg entry / จุด liq ใหม่</span></div>
+      <div id="${p}-adds"></div>
+      <button type="button" class="btn-fetch" id="${p}-addrow">+ เพิ่มไม้</button>
+    </div>
     <div class="results" id="${p}-results"></div>
     <div class="formula">Inverse: PnL(BTC) จาก mark ถึง P = ±N × (1/P_mark − 1/P)
 MM rate = 1% + 0.5% × (ขนาด position เป็น BTC / 100)   |   IM rate = 2% + ส่วนเพิ่มเดียวกัน
@@ -422,6 +440,79 @@ function calcFut(p) {
     </div>` + priceBar(hasEntry ? P0 : M, liq, dir === "long" ? "LONG" : "SHORT", M);
   }
 
+  /* ---------- what-if: เพิ่มไม้ ---------- */
+  /* หลักคิด: equity เปลี่ยนเฉพาะจากราคา (การเติมไม้ไม่เปลี่ยน equity ณ วินาทีเข้า)
+     PnL แต่ละไม้ = ±n × (1/ราคาเข้าไม้ − 1/P) จึงรวมเป็นผลบวกของทุกไม้ได้ตรง ๆ */
+  const adds = getAdds(p);
+  let addsHtml = "";
+  if (adds.length) {
+    const solveLiq = (terms, refP) => {
+      const Ntot = terms.reduce((s, t) => s + t.n, 0);
+      const mmR = P => useCustom && isFinite(mmCustom) ? mmCustom : 0.01 + 0.00005 * (Ntot / P);
+      const eq2 = P => dir === "long"
+        ? E + terms.reduce((s, t) => s + t.n * (1 / t.ref - 1 / P), 0)
+        : E + terms.reduce((s, t) => s + t.n * (1 / P - 1 / t.ref), 0);
+      const f2 = P => eq2(P) - mmR(P) * Ntot / P;
+      const st = {liq: NaN, noLiq: false, already: false, eq2, Ntot, mmR};
+      if (f2(refP) <= 0) { st.already = true; return st; }
+      if (dir === "long") {
+        st.liq = bisect(f2, refP * 1e-6, refP);
+      } else {
+        const eqInf = E + terms.reduce((s, t) => s - t.n / t.ref, 0);
+        if (eqInf >= 0) st.noLiq = true;
+        else { let hi = refP; for (let i = 0; i < 60 && f2(hi) > 0; i++) hi *= 2; st.liq = bisect(f2, refP, hi); }
+      }
+      return st;
+    };
+
+    /* เรียงตามลำดับที่ราคาจะวิ่งไปถึงก่อน: short ราคาขึ้น → ไม้ต่ำก่อน, long ราคาลง → ไม้สูงก่อน */
+    const sorted = [...adds].sort((a, b) => dir === "long" ? b.price - a.price : a.price - b.price);
+    const terms = [{n: N, ref: M}];
+    const warns = [];
+    let cur = {liq, noLiq, already};
+    sorted.forEach(a => {
+      const reachable = cur.noLiq || !isFinite(cur.liq) ||
+        (dir === "long" ? a.price > cur.liq : a.price < cur.liq);
+      if (!reachable && !cur.already)
+        warns.push(`ไม้ที่ $${fmtUsd(a.price)} จะไม่ทันเข้า — ราคาจะชนจุด liquidation ($${fmtUsd(cur.liq)}) ก่อนถึงไม้ (ต้องเติม margin ก่อน)`);
+      terms.push({n: a.size, ref: a.price});
+      cur = solveLiq(terms, a.price);
+      if (cur.already)
+        warns.push(`เมื่อไม้ที่ $${fmtUsd(a.price)} เข้า equity จะต่ำกว่า MM ทันที — position ใหญ่เกิน equity ที่มี`);
+    });
+
+    const lastP = sorted[sorted.length - 1].price;
+    const Ntot = cur.Ntot;
+    const addSum = adds.reduce((s, a) => s + a.size, 0);
+    const avg2 = hasEntry ? Ntot / (N / P0 + adds.reduce((s, a) => s + a.size / a.price, 0)) : NaN;
+    const eqAtLast = cur.eq2(lastP);
+    const lev2 = (Ntot / lastP) / eqAtLast;
+    const moved = (isFinite(cur.liq) && isFinite(liq)) ? cur.liq - liq : NaN;
+
+    let liqLine;
+    if (cur.already) {
+      liqLine = '<div class="liq-big danger"><div><div class="lab">หลังเพิ่มไม้ครบ</div><div class="val" style="font-size:1.1rem;">⚠ equity ต่ำกว่า MM ทันทีที่ไม้สุดท้ายเข้า</div></div></div>';
+    } else if (cur.noLiq) {
+      liqLine = '<div class="liq-big safe"><div><div class="lab">จุด Liquidation หลังเพิ่มไม้</div><div class="val">ไม่มี — equity ≥ ขนาด position รวมเป็น BTC</div></div></div>';
+    } else {
+      liqLine = `<div class="liq-big adds">
+        <div><div class="lab">จุด Liquidation หลังเพิ่มไม้ครบ ${adds.length} ไม้</div><div class="val">$${fmtUsd(cur.liq)}</div></div>
+        <div class="dist">${isFinite(moved) ? `เดิม $${fmtUsd(liq)} → ขยับ ${moved >= 0 ? "+" : ""}${fmtUsd2(moved)} (${fmtPct(Math.abs(moved) / liq)} ${(dir === "long" ? moved < 0 : moved > 0) ? "ไกลขึ้น ✓" : "ใกล้เข้ามา ⚠"})` : ""}</div>
+      </div>`;
+    }
+
+    addsHtml = `
+    ${liqLine}
+    <table class="detail">
+      <tr><td>Position รวมหลังเพิ่ม</td><td>$${fmtUsd(Ntot)} <span class="u">(เดิม $${fmtUsd(N)} + เพิ่ม $${fmtUsd(addSum)})</span></td></tr>
+      ${hasEntry ? `<tr><td>Avg entry ใหม่</td><td>$${fmtUsd2(avg2)} <span class="u">(เดิม $${fmtUsd2(P0)})</span></td></tr>` : ""}
+      <tr><td>Equity ณ ไม้สุดท้าย ($${fmtUsd(lastP)})</td><td>${fmtBtc(eqAtLast)} <span class="u">BTC</span></td></tr>
+      <tr><td>Leverage ณ ไม้สุดท้าย</td><td>${isFinite(lev2) ? lev2.toLocaleString("en-US", {maximumFractionDigits: 2}) + "x" : "—"}</td></tr>
+      ${isFinite(cur.liq) ? `<tr class="hl"><td>MM rate ณ จุด liquidation ใหม่</td><td>${fmtPct(cur.mmR(cur.liq))}</td></tr>` : ""}
+    </table>
+    ${warns.map(w => `<div class="warn">⚠ ${w}</div>`).join("")}`;
+  }
+
   out.innerHTML = head + `
     <table class="detail">
       <tr><td>ขนาด position ณ mark</td><td>${fmtBtc(sizeBtc)} <span class="u">BTC</span> ($${fmtUsd(N)})</td></tr>
@@ -435,8 +526,35 @@ function calcFut(p) {
       <tr><td>Buffer เหนือ MM ตอนนี้</td><td>${fmtBtc(E - mm)} <span class="u">BTC</span></td></tr>
       ${isFinite(liq) ? `<tr class="hl"><td>MM rate ณ จุด liquidation</td><td>${fmtPct(mmRate(liq))}</td></tr>` : ""}
     </table>
+    ${addsHtml}
     ${eqDerived ? `<div class="warn">⚠ Equity ถูก derive จาก balance + PnL นับจาก avg entry — <b>ถ้า position นี้ผ่าน daily settlement (08:00 UTC) มาแล้ว ค่านี้จะนับ PnL ซ้ำและสูง/ต่ำกว่าจริง</b> เพราะ balance ของ Deribit มี PnL ที่ settle แล้วรวมอยู่ แนะนำกรอก Equity จากหน้า Deribit ตรง ๆ จะแม่นที่สุด</div>` : ""}
     <div class="warn">⚠ ค่าโดยประมาณ: Deribit liquidate แบบ incremental (ทยอยลดขนาด position) และเช็กกับ mark price ไม่ใช่ last price${p === "perp" ? " · funding fee ที่จ่าย/รับจะขยับ equity และจุด liquidation จริงตลอดเวลา" : " · future มี basis — mark ของสัญญาอาจต่างจาก index หลายร้อยดอลลาร์"}</div>`;
+}
+
+function addAddRow(p, price, size) {
+  const wrap = document.getElementById(p + "-adds");
+  const row = document.createElement("div");
+  row.className = "add-row";
+  row.innerHTML = `<span class="add-lab">ไม้ ${wrap.children.length + 1}</span>
+    <input type="number" class="add-price" placeholder="ราคา (USD)" step="100" ${price ? `value="${price}"` : ""}>
+    <input type="number" class="add-size" placeholder="ขนาด (USD)" step="100" ${size ? `value="${size}"` : ""}>
+    <button type="button" class="add-del" title="ลบไม้นี้">✕</button>`;
+  row.querySelectorAll("input").forEach(el => el.addEventListener("input", () => calcFut(p)));
+  row.querySelector(".add-del").addEventListener("click", () => {
+    row.remove();
+    [...wrap.children].forEach((r, i) => r.querySelector(".add-lab").textContent = "ไม้ " + (i + 1));
+    calcFut(p);
+  });
+  wrap.appendChild(row);
+}
+
+function getAdds(p) {
+  return [...document.getElementById(p + "-adds").querySelectorAll(".add-row")]
+    .map(r => ({
+      price: parseFloat(r.querySelector(".add-price").value),
+      size: parseFloat(r.querySelector(".add-size").value),
+    }))
+    .filter(a => a.price > 0 && a.size > 0);
 }
 
 function initFutForms() {
@@ -445,6 +563,7 @@ function initFutForms() {
     div.innerHTML = FUT_FORM(p);
     div.querySelectorAll("input, select").forEach(el =>
       el.addEventListener("input", () => calcFut(p)));
+    document.getElementById(p + "-addrow").addEventListener("click", () => { addAddRow(p); });
     initFutFetch(p);
     calcFut(p);
   });
