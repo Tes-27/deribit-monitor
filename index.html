@@ -713,6 +713,38 @@ async function deribitAuth(acc) {
   }, Math.max((r.expires_in - 60) * 1000, 60000));
 }
 
+// Deribit เลิกส่ง estimated_liquidation_price แล้ว — คำนวณเองแบบ cross margin:
+// แก้สมการ equity(P) = maintenance margin(P) โดยสอบเทียบ MMR จาก maintenance_margin
+// จริงของ position (รวม tier แล้ว) · equity ของ position อื่นถูกหักส่วน MM ออกก่อน
+function deribitLiqEstimate(p, cat, sums) {
+  const S = Math.abs(p.size), M = p.mark_price, dirBuy = p.direction === "buy";
+  if (!S || !M) return null;
+  if (cat === "inverse") {
+    const sum = sums[0];
+    if (!sum || !(sum.equity > 0)) return null;
+    const eq = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin * M / S : 0.005;
+    if (dirBuy) {
+      const den = eq + S / M;
+      return den > 0 ? S * (1 + r) / den : null;
+    }
+    const den = S / M - eq;
+    return den > 0 ? S * (1 - r) / den : null; // den<=0 = equity หนาพอ ไม่โดน liq
+  }
+  if (cat === "future") { // linear settle USDC
+    const sum = sums[1];
+    if (!sum || !(sum.equity > 0)) return null;
+    const eq = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (S * M) : 0.005;
+    if (dirBuy) {
+      const v = (M - eq / S) / (1 - r);
+      return v > 0 ? v : null;
+    }
+    return (M + eq / S) / (1 + r);
+  }
+  return null; // option ไม่คำนวณ
+}
+
 async function refreshDeribit(acc) {
   if (!acc.authed) return;
   const posLists = await Promise.all(DERIBIT_CCY.map(c =>
@@ -722,14 +754,22 @@ async function refreshDeribit(acc) {
   const sums = await Promise.all(["BTC", "USDC"].map(c =>
     acc.conn.rpc("private/get_account_summary", { currency: c }).catch(() => null)));
 
-  acc.positions = posLists.flat().filter(p => p.size !== 0).map(p => ({
-    key: ikey("deribit", deribitCat(p.instrument_name), p.instrument_name),
-    symbol: p.instrument_name, cat: deribitCat(p.instrument_name),
-    dirBuy: p.direction === "buy", size: Math.abs(p.size),
-    entry: p.average_price, mark: p.mark_price,
-    liq: p.estimated_liquidation_price || null,
-    upnl: p.floating_profit_loss, upnlCcy: "",
-  }));
+  acc.positions = posLists.flat().filter(p => p.size !== 0).map(p => {
+    const cat = deribitCat(p.instrument_name);
+    let liq = p.estimated_liquidation_price || null, liqEst = false;
+    if (!liq) {
+      liq = deribitLiqEstimate(p, cat, sums);
+      liqEst = !!liq;
+    }
+    return {
+      key: ikey("deribit", cat, p.instrument_name),
+      symbol: p.instrument_name, cat,
+      dirBuy: p.direction === "buy", size: Math.abs(p.size),
+      entry: p.average_price, mark: p.mark_price,
+      liq, liqEst,
+      upnl: p.floating_profit_loss, upnlCcy: "",
+    };
+  });
   acc.orders = ordLists.flat().map(o => ({
     key: ikey("deribit", deribitCat(o.instrument_name), o.instrument_name),
     symbol: o.instrument_name, cat: deribitCat(o.instrument_name),
@@ -1048,13 +1088,13 @@ function renderHeader() {
   visibleAccounts().forEach(a => a.positions.forEach(p => {
     if (p.key !== instrument || !p.liq) return;
     if (!best || Math.abs(p.liq - lastPrice) < Math.abs(best.liq - lastPrice)) {
-      best = { liq: p.liq, name: a.name };
+      best = { liq: p.liq, name: a.name, est: p.liqEst };
     }
   }));
   if (best && lastPrice) {
     const dist = (best.liq - lastPrice) / lastPrice * 100;
     const tag = isOverview() ? `[${best.name}] ` : "";
-    el.textContent = `${tag}LIQ ${fmtP(best.liq)} (${dist > 0 ? "+" : ""}${dist.toFixed(1)}%)`;
+    el.textContent = `${tag}LIQ ${best.est ? "≈" : ""}${fmtP(best.liq)} (${dist > 0 ? "+" : ""}${dist.toFixed(1)}%)`;
     el.style.color = Math.abs(dist) < 10 ? "var(--liq)" : "var(--muted)";
   } else {
     el.textContent = "";
@@ -1070,7 +1110,7 @@ function renderLines() {
       addLine(pos.entry, "#4a90d9",
         `${tag}ENTRY ${pos.dirBuy ? "LONG" : "SHORT"} ${fmt(pos.size)}`,
         LightweightCharts.LineStyle.Solid, 1);
-      addLine(pos.liq, "#ff3b5c", `${tag}LIQUIDATION`, LightweightCharts.LineStyle.Solid, 2);
+      addLine(pos.liq, "#ff3b5c", `${tag}LIQUIDATION${pos.liqEst ? " ≈" : ""}`, LightweightCharts.LineStyle.Solid, 2);
     });
     a.orders.filter(o => o.key === instrument).forEach(o => {
       addLine(o.price, o.dirBuy ? "#26a69a" : "#ff9f43",
@@ -1086,7 +1126,7 @@ function posRowHtml(p) {
     <span class="${p.dirBuy ? "long" : "short"}">${p.dirBuy ? "LONG" : "SHORT"} ${fmt(p.size)}</span>
     <span><span class="lbl">entry</span> ${fmtP(p.entry)}</span>
     <span><span class="lbl">mark</span> ${fmtP(p.mark)}</span>
-    <span><span class="lbl">liq</span> <span class="liq-val">${p.liq ? fmtP(p.liq) : "–"}</span></span>
+    <span><span class="lbl">liq</span> <span class="liq-val" ${p.liqEst ? 'title="คำนวณเองจาก equity+MM (Deribit เลิกส่งค่านี้ใน API)"' : ""}>${p.liq ? (p.liqEst ? "≈" : "") + fmtP(p.liq) : "–"}</span></span>
     <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + esc(p.upnlCcy) : ""}</span></span>
   </div>`;
 }
