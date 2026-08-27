@@ -990,13 +990,31 @@ function phemexRebuild(acc) {
       const r = scaled
         ? (+(p.maintMarginReqEr ?? p.maintenanceMarginReqEr) || 0) / PHEMEX_SCALE_V
         : parseFloat(p.maintMarginReqRr ?? p.maintMarginReq ?? "") || 0;
-      const isCross = p.crossMargin === true || +(p.leverageEr ?? p.leverageRr ?? 1) === 0;
+      // leverage: Phemex ใช้ค่าติดลบ/ศูนย์แทนโหมด cross (ขนาดคือ leverage ที่ตั้งไว้)
+      const levRaw = scaled
+        ? (+(p.leverageEr ?? 0)) / PHEMEX_SCALE_V
+        : parseFloat(p.leverageRr ?? p.leverage ?? "0") || 0;
+      const isCross = p.crossMargin === true || levRaw <= 0;
+      const lev = Math.abs(levRaw);
       let margin = scaled
         ? (+(p.assignedPosBalanceEv ?? p.positionMarginEv ?? p.usedBalanceEv) || 0) / PHEMEX_SCALE_V
         : parseFloat(p.assignedPosBalanceRv ?? p.positionMarginRv ?? p.usedBalanceRv ?? "") || 0;
       if (isCross) { // cross: ใช้ balance ทั้งบัญชีของสกุลนั้นแทน margin เฉพาะไม้
         const bal = S.bal.get(`${src}:${cat === "inverse" ? (p.currency || "BTC") : "USDT"}`);
         if (bal) margin = scaled ? +bal.a.accountBalanceEv / PHEMEX_SCALE_V : +(bal.a.accountBalanceRv || 0);
+        // Phemex หัก margin ที่จองให้ order ฝั่ง "เพิ่ม position" (สัญลักษณ์เดียวกัน) ออกจาก balance ด้วย
+        if (lev > 0) {
+          const taker = cat === "inverse" ? 0.00075 : 0.0006;
+          [...S.ord.values()].forEach(({ src: osrc, o }) => {
+            if (osrc !== src || o.symbol !== p.symbol || o.reduceOnly) return;
+            if ((o.side === "Buy") !== (side === "Buy")) return;
+            const oprice = osrc === "v1" ? +o.priceEp / PHEMEX_SCALE_P : +(o.priceRp || o.price) || 0;
+            const oqty = Math.abs(+o.orderQty || 0) - Math.abs(+o.cumQty || 0);
+            if (!oprice || oqty <= 0) return;
+            const val = cat === "inverse" ? oqty / oprice : oqty * oprice;
+            margin -= val / lev + val * taker * 2; // IM ของ order + ค่า fee เปิด/ปิดโดยประมาณ
+          });
+        }
       }
       if (r > 0 && margin > 0) {
         const fee = cat === "inverse" ? 0.00075 : 0.0006; // taker fee โดยประมาณ (ค่าปิด position)
