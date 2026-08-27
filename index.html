@@ -14,7 +14,7 @@
     --bg: #12151c; --panel: #1a1e28; --border: #2a2f3d;
     --text: #d5dae6; --muted: #7d8598;
     --green: #26a69a; --red: #ef5350; --blue: #4a90d9;
-    --orange: #ff9f43; --liq: #ff3b5c;
+    --orange: #ff9f43; --liq: #ff9800; /* liquidation = ส้ม แบบ Phemex */
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -355,7 +355,7 @@ function addLine(price, color, title, style, width) {
 let lastPrice = null;
 
 /* ================= generic websocket (reconnect + ping) ================= */
-function createWS({ url, onOpen, onMessage, onStatus, pingText, pingSec }) {
+function createWS({ url, onOpen, onMessage, onStatus, onDisconnect, pingText, pingSec }) {
   let ws = null, closed = false, delay = 1000, pingTimer = null;
   function open() {
     if (closed) return;
@@ -373,6 +373,7 @@ function createWS({ url, onOpen, onMessage, onStatus, pingText, pingSec }) {
     ws.onmessage = ev => onMessage(ev.data, m => { try { ws.send(m); } catch {} });
     ws.onclose = () => {
       clearInterval(pingTimer);
+      onDisconnect && onDisconnect();
       if (closed) return;
       onStatus && onStatus("err", "reconnecting…");
       setTimeout(open, delay);
@@ -397,10 +398,13 @@ function createDeribitConn({ onOpen, onSub, onStatus }) {
   let sendFn = null;
   const ws = createWS({
     url: deribitUrl(),
+    onDisconnect: () => { // reject คำขอที่ค้างทันทีตอนสายหลุด — ไม่ปล่อยให้แขวนรอ reconnect
+      sendFn = null;
+      pending.forEach(p => p.reject(new Error("connection closed")));
+      pending.clear();
+    },
     onOpen: async send => {
       sendFn = send;
-      pending.forEach(p => p.reject(new Error("reconnected")));
-      pending.clear();
       await rpc("public/set_heartbeat", { interval: 30 });
       await onOpen();
     },
@@ -1201,12 +1205,12 @@ function renderLines() {
       addLine(pos.entry, "#4a90d9",
         `${tag}ENTRY ${pos.dirBuy ? "LONG" : "SHORT"} ${fmt(pos.size)}`,
         LightweightCharts.LineStyle.Solid, 1);
-      addLine(pos.liq, "#ff3b5c", `${tag}LIQUIDATION${pos.liqEst ? " ≈" : ""}`, LightweightCharts.LineStyle.Solid, 2);
-      if (pos.liqFills) addLine(pos.liqFills, "#ff8fa3", `${tag}LIQ ถ้าไม้ fill หมด ≈`,
+      addLine(pos.liq, "#ff9800", `${tag}LIQUIDATION${pos.liqEst ? " ≈" : ""}`, LightweightCharts.LineStyle.Solid, 2);
+      if (pos.liqFills) addLine(pos.liqFills, "#ffc069", `${tag}LIQ ถ้าไม้ fill หมด ≈`,
         LightweightCharts.LineStyle.Dashed, 1);
     });
     a.orders.filter(o => o.key === instrument).forEach(o => {
-      addLine(o.price, o.dirBuy ? "#26a69a" : "#ff9f43",
+      addLine(o.price, o.dirBuy ? "#26a69a" : "#ef5350",
         `${tag}${o.dirBuy ? "BUY" : "SELL"} ${fmt(o.amount)}`,
         LightweightCharts.LineStyle.Dashed, 1);
     });
