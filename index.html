@@ -656,7 +656,7 @@ function buildAccounts() {
     idx, exchange: a.exchange || "deribit", name: a.name || `Port ${idx + 1}`,
     key: a.clientId, secret: a.clientSecret,
     conn: null, authed: false, error: null, status: "",
-    positions: [], orders: [], equityParts: [], mmPct: null,
+    positions: [], orders: [], equityParts: [], mmPct: null, imPct: null,
     authTimer: null, refreshQueued: false,
     px: null, // state ของ phemex (merge จาก AOP)
   }));
@@ -745,6 +745,38 @@ function deribitLiqEstimate(p, cat, sums) {
   return null; // option ไม่คำนวณ
 }
 
+// what-if: จุด liq ถ้า order ฝั่งเพิ่ม position (instrument เดียวกัน) fill หมดทุกใบ
+// wallet balance คงเดิม, position รวมใหม่ = ของเดิม + ไม้ทุกใบที่ราคา limit, MMR ต่อ notional คงอัตราเดิม
+function deribitLiqAfterFills(p, cat, sums, rawOrders) {
+  const S = Math.abs(p.size), E = p.average_price, M = p.mark_price;
+  if (!S || !E || !M) return null;
+  const dirBuy = p.direction === "buy";
+  const adds = rawOrders.filter(o => o.instrument_name === p.instrument_name &&
+    o.direction === p.direction && o.price > 0 && (o.amount - (o.filled_amount || 0)) > 0);
+  if (!adds.length) return null;
+  const sum = sums[cat === "inverse" ? 0 : 1];
+  if (!sum || !(sum.equity > 0)) return null;
+  const eqEff = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
+  if (cat === "inverse") {
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin * M / S : 0.005;
+    const WB = eqEff - (dirBuy ? 1 : -1) * S * (1 / E - 1 / M); // ถอด uPnL ณ mark ออก
+    let S2 = S, inv2 = S / E;
+    adds.forEach(o => { const q = o.amount - (o.filled_amount || 0); S2 += q; inv2 += q / o.price; });
+    if (dirBuy) { const den = WB + inv2; return den > 0 ? S2 * (1 + r) / den : null; }
+    const den = inv2 - WB;
+    return den > 0 ? S2 * (1 - r) / den : null;
+  }
+  if (cat === "future") {
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (S * M) : 0.005;
+    const WB = eqEff - (dirBuy ? 1 : -1) * S * (M - E);
+    let S2 = S, cost2 = S * E;
+    adds.forEach(o => { const q = o.amount - (o.filled_amount || 0); S2 += q; cost2 += q * o.price; });
+    if (dirBuy) { const num = cost2 - WB; return num > 0 ? num / (S2 * (1 - r)) : null; }
+    return (cost2 + WB) / (S2 * (1 + r));
+  }
+  return null;
+}
+
 async function refreshDeribit(acc) {
   if (!acc.authed) return;
   const posLists = await Promise.all(DERIBIT_CCY.map(c =>
@@ -753,6 +785,7 @@ async function refreshDeribit(acc) {
     acc.conn.rpc("private/get_open_orders_by_currency", { currency: c }).catch(() => [])));
   const sums = await Promise.all(["BTC", "USDC"].map(c =>
     acc.conn.rpc("private/get_account_summary", { currency: c }).catch(() => null)));
+  const rawOrders = ordLists.flat();
 
   acc.positions = posLists.flat().filter(p => p.size !== 0).map(p => {
     const cat = deribitCat(p.instrument_name);
@@ -767,10 +800,11 @@ async function refreshDeribit(acc) {
       dirBuy: p.direction === "buy", size: Math.abs(p.size),
       entry: p.average_price, mark: p.mark_price,
       liq, liqEst,
+      liqFills: deribitLiqAfterFills(p, cat, sums, rawOrders),
       upnl: p.floating_profit_loss, upnlCcy: "",
     };
   });
-  acc.orders = ordLists.flat().map(o => ({
+  acc.orders = rawOrders.map(o => ({
     key: ikey("deribit", deribitCat(o.instrument_name), o.instrument_name),
     symbol: o.instrument_name, cat: deribitCat(o.instrument_name),
     dirBuy: o.direction === "buy", type: o.order_type,
@@ -781,6 +815,9 @@ async function refreshDeribit(acc) {
   if (sums[1] && sums[1].equity > 0.01) acc.equityParts.push(`${fmtP(sums[1].equity)} USDC`);
   acc.mmPct = sums[0] && sums[0].equity > 0 && sums[0].maintenance_margin > 0
     ? sums[0].maintenance_margin / sums[0].equity * 100 : null;
+  // IM โชว์คู่ MM ไว้พิสูจน์ว่า order กระทบแค่ IM: ลอง วาง/ถอด order แล้ว IM ขยับ ส่วน MM (ตัวกำหนด liq) นิ่ง
+  acc.imPct = sums[0] && sums[0].equity > 0 && sums[0].initial_margin > 0
+    ? sums[0].initial_margin / sums[0].equity * 100 : null;
   rebuildInstrumentSel();
   renderAll();
 }
@@ -1165,6 +1202,8 @@ function renderLines() {
         `${tag}ENTRY ${pos.dirBuy ? "LONG" : "SHORT"} ${fmt(pos.size)}`,
         LightweightCharts.LineStyle.Solid, 1);
       addLine(pos.liq, "#ff3b5c", `${tag}LIQUIDATION${pos.liqEst ? " ≈" : ""}`, LightweightCharts.LineStyle.Solid, 2);
+      if (pos.liqFills) addLine(pos.liqFills, "#ff8fa3", `${tag}LIQ ถ้าไม้ fill หมด ≈`,
+        LightweightCharts.LineStyle.Dashed, 1);
     });
     a.orders.filter(o => o.key === instrument).forEach(o => {
       addLine(o.price, o.dirBuy ? "#26a69a" : "#ff9f43",
@@ -1182,14 +1221,18 @@ function posRowHtml(p) {
     <span><span class="lbl">mark</span> ${fmtP(p.mark)}</span>
     <span><span class="lbl">liq</span> <span class="liq-val" ${p.liqEst ? 'title="คำนวณเองจาก equity+MM (Deribit เลิกส่งค่านี้ใน API)"' : ""}>${p.liq ? (p.liqEst ? "≈" : "") + fmtP(p.liq) : "–"}</span>${p.liqChk ? ` <span class="lbl" title="ตรวจสูตร — API ให้ ${fmtP(p.liq)} · สูตรเรา ≈${fmtP(p.liqChk.est)} · ถ้ารวมค่า fee ปิด ≈${fmtP(p.liqChk.estFee)}">(สูตรเรา ≈${fmtP(p.liqChk.est)} · Δ${p.liqChk.diffPct >= 0 ? "+" : ""}${p.liqChk.diffPct.toFixed(2)}%)</span>` : ""}</span>
     <span><span class="lbl">uPnL</span> <span class="${p.upnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(p.upnl)}${p.upnlCcy ? " " + esc(p.upnlCcy) : ""}</span></span>
+    ${p.liqFills ? `<span title="what-if: ถ้า order ฝั่งเพิ่ม position ของ instrument นี้ fill ครบทุกใบ"><span class="lbl">liq ถ้า fill หมด</span> <span style="color:var(--liq);opacity:.7">≈${fmtP(p.liqFills)}</span></span>` : ""}
   </div>`;
 }
 
 function accBlockHtml(a) {
   let html = `<div class="acc-block">`;
   let mm = "";
+  if (a.imPct != null) {
+    mm += `<span title="Initial Margin ÷ equity — order ที่วางไว้ถูกนับรวมในตัวนี้"><span class="lbl">IM</span> ${a.imPct.toFixed(1)}%</span> `;
+  }
   if (a.mmPct != null) {
-    mm = `<span><span class="lbl">MM</span> <span style="color:${a.mmPct > 50 ? "var(--liq)" : "inherit"}">${a.mmPct.toFixed(1)}%</span></span>`;
+    mm += `<span title="Maintenance Margin ÷ equity — ตัวกำหนดจุด liquidate (order ไม่ถูกนับ)"><span class="lbl">MM</span> <span style="color:${a.mmPct > 50 ? "var(--liq)" : "inherit"}">${a.mmPct.toFixed(1)}%</span></span>`;
   }
   html += `<div class="acc-head">
     <b>${esc(a.name)}</b><span class="ex-tag">${esc(a.exchange)}</span>
