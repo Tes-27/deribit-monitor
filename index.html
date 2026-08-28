@@ -522,6 +522,7 @@ const PHEMEX_SCALE_V = 1e8;  // สเกลมูลค่า (Ev)
 /* ================= chart controller ================= */
 let chartSrc = null;      // {stop()} ของ source ปัจจุบัน
 let chartToken = 0;       // กันการสลับกราฟซ้อนกัน
+let chartFirstTime = 0;   // เวลาแท่งแรกที่โหลด — ใช้กรอง trade marker ให้อยู่ในช่วงกราฟ
 
 function tfForExchange(ex) {
   if (!TF_LABELS[ex].includes(tfLabel)) tfLabel = "1h";
@@ -536,6 +537,8 @@ async function loadChart() {
   renderTf(ex);
   document.getElementById("exBadge").textContent = ex;
   series.setData([]);
+  series.setMarkers([]);
+  chartFirstTime = 0;
   lastPrice = null;
   try {
     if (ex === "deribit") chartSrc = await chartDeribit(sym, my);
@@ -561,8 +564,10 @@ async function chartDeribit(sym, my) {
     time: t / 1000, open: d.open[i], high: d.high[i], low: d.low[i], close: d.close[i],
   }));
   series.setData(bars);
+  chartFirstTime = bars.length ? bars[0].time : 0;
   lastPrice = bars.length ? bars[bars.length - 1].close : null;
   chart.timeScale().fitContent();
+  refreshTradeMarkers();
   const chans = [`chart.trades.${sym}.${res}`];
   deribitChartChannel = chans[0];
   if (deribitCat(sym) === "option") { // option ไม่ค่อยมี trade — ตาม mark price ด้วย
@@ -650,6 +655,41 @@ async function chartPhemex(cat, sym, my) {
     onStatus: (s, msg) => { if (iparse(instrument).ex === "phemex") setConn(s, msg && "phemex: " + msg); },
   });
   return { stop() { ws.close(); } };
+}
+
+/* ================= trade markers (B/S บนกราฟ — deribit) ================= */
+let tradeMarkerToken = 0;
+async function refreshTradeMarkers() {
+  const my = ++tradeMarkerToken;
+  const { ex, sym } = iparse(instrument);
+  if (ex !== "deribit") { series.setMarkers([]); return; }
+  const accs = visibleAccounts().filter(a => a.exchange === "deribit" && a.authed && a.conn);
+  if (!accs.length) { series.setMarkers([]); return; }
+  const lists = await Promise.all(accs.map(a =>
+    a.conn.rpc("private/get_user_trades_by_instrument",
+      { instrument_name: sym, count: 500, sorting: "desc" })
+      .then(r => r.trades || []).catch(() => [])));
+  if (my !== tradeMarkerToken) return; // มีการเรียกใหม่ทับระหว่างรอ
+  const tf = TF_SEC[tfLabel];
+  const buckets = new Map(); // "เวลาแท่ง|ทิศทาง" → ปริมาณรวม
+  lists.flat().forEach(t => {
+    const bt = Math.floor(t.timestamp / 1000 / tf) * tf;
+    if (chartFirstTime && bt < chartFirstTime) return;
+    const k = bt + "|" + t.direction;
+    buckets.set(k, (buckets.get(k) || 0) + (+t.amount || 0));
+  });
+  const markers = [...buckets.keys()].map(k => {
+    const [bt, dir] = k.split("|");
+    const buy = dir === "buy";
+    return {
+      time: +bt,
+      position: buy ? "belowBar" : "aboveBar",
+      color: buy ? "#26a69a" : "#ef5350",
+      shape: buy ? "arrowUp" : "arrowDown",
+      text: buy ? "B" : "S",
+    };
+  }).sort((a, b) => a.time - b.time);
+  series.setMarkers(markers);
 }
 
 /* ================= accounts ================= */
@@ -824,6 +864,7 @@ async function refreshDeribit(acc) {
     ? sums[0].initial_margin / sums[0].equity * 100 : null;
   rebuildInstrumentSel();
   renderAll();
+  refreshTradeMarkers(); // เผื่อมีไม้ fill ใหม่ระหว่างนี้
 }
 
 /* ---------- bybit account (REST + private WS trigger) ---------- */
@@ -1173,6 +1214,7 @@ document.getElementById("tabbar").addEventListener("click", e => {
   activeTab = tab.dataset.tab;
   store.set("deribit_monitor_tab", activeTab);
   renderAll();
+  refreshTradeMarkers(); // ชุดพอร์ทที่มองเห็นเปลี่ยน → marker เปลี่ยนตาม
 });
 
 /* ================= rendering ================= */
