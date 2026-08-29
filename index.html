@@ -667,7 +667,8 @@ async function refreshTradeMarkers() {
   if (!accs.length) { series.setMarkers([]); return; }
   const lists = await Promise.all(accs.map(a =>
     a.conn.rpc("private/get_user_trades_by_instrument",
-      { instrument_name: sym, count: 1000, sorting: "desc" })
+      // include_old จำเป็น — ไม่ใส่แล้ว deribit ตัดเหลือแค่ trade 24 ชม. ล่าสุด
+      { instrument_name: sym, count: 1000, sorting: "desc", include_old: true })
       .then(r => r.trades || []).catch(() => [])));
   if (my !== tradeMarkerToken) return; // มีการเรียกใหม่ทับระหว่างรอ
   const tf = TF_SEC[tfLabel];
