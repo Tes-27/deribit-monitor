@@ -169,7 +169,8 @@
       <label for="inTestnet" style="margin:0">ใช้ Testnet — มีผลเฉพาะพอร์ท Deribit (Bybit/Phemex ชี้ mainnet เสมอ)</label>
     </div>
     <div class="warn">Bybit ต่อผ่านโดเมนสำรองทางการ api.bytick.com (เพราะ api.bybit.com ถูกบล็อก DNS จากเน็ตไทย)
-      · Phemex ใช้ WebSocket ล้วนเพราะ REST ของเขาไม่เปิด CORS ให้ browser</div>
+      · Phemex ใช้ WebSocket ล้วนเพราะ REST ของเขาไม่เปิด CORS ให้ browser
+      · <span id="buildTag"></span></div>
     <div class="modal-actions">
       <button id="btnCancel">ปิด</button>
       <button id="btnSave" class="btn-primary">บันทึก & เชื่อมต่อ</button>
@@ -179,6 +180,9 @@
 
 <script>
 "use strict";
+
+const BUILD = "2026-08-29a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
 const store = {
@@ -658,6 +662,33 @@ async function chartPhemex(cat, sym, my) {
 }
 
 /* ================= trade markers (B/S บนกราฟ — deribit) ================= */
+// ไล่ลองหลายวิธี: endpoint แบบระบุช่วงเวลา (ตามช่วงกราฟ) ก่อน แล้วค่อย fallback
+// เพราะ endpoint แบบไม่ระบุช่วงถูก deribit ตัดเหลือ trade 24 ชม. ล่าสุด
+async function fetchDeribitTrades(a, sym) {
+  const end = Date.now();
+  const start = (chartFirstTime ? chartFirstTime * 1000 : end - 30 * 86400000) - 60000;
+  const attempts = [
+    ["private/get_user_trades_by_instrument_and_time",
+      { instrument_name: sym, start_timestamp: start, end_timestamp: end, count: 1000, sorting: "desc", include_old: true }],
+    ["private/get_user_trades_by_instrument_and_time",
+      { instrument_name: sym, start_timestamp: start, end_timestamp: end, count: 1000, sorting: "desc" }],
+    ["private/get_user_trades_by_instrument",
+      { instrument_name: sym, count: 1000, sorting: "desc", include_old: true }],
+  ];
+  for (const [method, params] of attempts) {
+    try {
+      const r = await a.conn.rpc(method, params);
+      const trades = (r && r.trades) || [];
+      console.debug("[trades]", method, "→", trades.length, "รายการ",
+        trades.length ? "เก่าสุด=" + new Date(Math.min(...trades.map(t => t.timestamp))).toLocaleString() : "");
+      return trades;
+    } catch (e) {
+      console.debug("[trades] fail", method, e.message);
+    }
+  }
+  return [];
+}
+
 let tradeMarkerToken = 0;
 async function refreshTradeMarkers() {
   const my = ++tradeMarkerToken;
@@ -665,11 +696,7 @@ async function refreshTradeMarkers() {
   if (ex !== "deribit") { series.setMarkers([]); return; }
   const accs = visibleAccounts().filter(a => a.exchange === "deribit" && a.authed && a.conn);
   if (!accs.length) { series.setMarkers([]); return; }
-  const lists = await Promise.all(accs.map(a =>
-    a.conn.rpc("private/get_user_trades_by_instrument",
-      // include_old จำเป็น — ไม่ใส่แล้ว deribit ตัดเหลือแค่ trade 24 ชม. ล่าสุด
-      { instrument_name: sym, count: 1000, sorting: "desc", include_old: true })
-      .then(r => r.trades || []).catch(() => [])));
+  const lists = await Promise.all(accs.map(a => fetchDeribitTrades(a, sym)));
   if (my !== tradeMarkerToken) return; // มีการเรียกใหม่ทับระหว่างรอ
   const tf = TF_SEC[tfLabel];
   const buckets = new Map(); // "เวลาแท่ง|ทิศทาง" → {amount, fills}
@@ -1452,6 +1479,7 @@ function boot() {
 
 function restartAll() { stopAll(); boot(); }
 
+document.getElementById("buildTag").textContent = "build " + BUILD;
 if (!cfg.accounts.length) {
   accList.appendChild(accEditRow(null));
   modal.classList.add("show");
