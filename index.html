@@ -667,18 +667,22 @@ async function refreshTradeMarkers() {
   if (!accs.length) { series.setMarkers([]); return; }
   const lists = await Promise.all(accs.map(a =>
     a.conn.rpc("private/get_user_trades_by_instrument",
-      { instrument_name: sym, count: 500, sorting: "desc" })
+      { instrument_name: sym, count: 1000, sorting: "desc" })
       .then(r => r.trades || []).catch(() => [])));
   if (my !== tradeMarkerToken) return; // มีการเรียกใหม่ทับระหว่างรอ
   const tf = TF_SEC[tfLabel];
-  const buckets = new Map(); // "เวลาแท่ง|ทิศทาง" → ปริมาณรวม
+  const buckets = new Map(); // "เวลาแท่ง|ทิศทาง" → {amount, fills}
   lists.flat().forEach(t => {
     const bt = Math.floor(t.timestamp / 1000 / tf) * tf;
     if (chartFirstTime && bt < chartFirstTime) return;
     const k = bt + "|" + t.direction;
-    buckets.set(k, (buckets.get(k) || 0) + (+t.amount || 0));
+    const b = buckets.get(k) || { amount: 0, fills: 0 };
+    b.amount += +t.amount || 0;
+    b.fills += 1;
+    buckets.set(k, b);
   });
-  const markers = [...buckets.keys()].map(k => {
+  const compact = n => n >= 1000 ? (n / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 }) + "k" : String(n);
+  const markers = [...buckets.entries()].map(([k, b]) => {
     const [bt, dir] = k.split("|");
     const buy = dir === "buy";
     return {
@@ -686,7 +690,8 @@ async function refreshTradeMarkers() {
       position: buy ? "belowBar" : "aboveBar",
       color: buy ? "#26a69a" : "#ef5350",
       shape: buy ? "arrowUp" : "arrowDown",
-      text: buy ? "B" : "S",
+      // ไม้หลายใบในแท่งเดียวกันถูกรวม — โชว์ปริมาณรวมกำกับไว้
+      text: (buy ? "B " : "S ") + compact(b.amount),
     };
   }).sort((a, b) => a.time - b.time);
   series.setMarkers(markers);
