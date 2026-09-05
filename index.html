@@ -181,7 +181,7 @@
 <script>
 "use strict";
 
-const BUILD = "2026-08-29a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-05a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -793,20 +793,23 @@ async function deribitAuth(acc) {
 // Deribit เลิกส่ง estimated_liquidation_price แล้ว — คำนวณเองแบบ cross margin:
 // แก้สมการ equity(P) = maintenance margin(P) โดยสอบเทียบ MMR จาก maintenance_margin
 // จริงของ position (รวม tier แล้ว) · equity ของ position อื่นถูกหักส่วน MM ออกก่อน
-function deribitLiqEstimate(p, cat, sums) {
+// extraUsd = หลักประกันสกุลอื่น (USDC/USDT) คิดเป็น USD — บัญชี cross-collateral/PM ใช้ค้ำ position BTC ได้
+// สมการ (inverse, คิดเป็น USD): usdc + btc·P + PnL_USD(P) = r·S  →  long: P = (S(1+r) − usdc)/(eqBTC + S/M)
+function deribitLiqEstimate(p, cat, sums, extraUsd = 0) {
   const S = Math.abs(p.size), M = p.mark_price, dirBuy = p.direction === "buy";
   if (!S || !M) return null;
   if (cat === "inverse") {
     const sum = sums[0];
-    if (!sum || !(sum.equity > 0)) return null;
-    const eq = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
+    if (!sum || !(sum.equity > 0 || extraUsd > 0)) return null;
+    const eq = (sum.equity || 0) - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
     const r = p.maintenance_margin > 0 ? p.maintenance_margin * M / S : 0.005;
     if (dirBuy) {
+      const num = S * (1 + r) - extraUsd; // USDC คุ้ม notional ทั้งก้อน → ราคาลงถึง 0 ก็ไม่โดน
       const den = eq + S / M;
-      return den > 0 ? S * (1 + r) / den : null;
+      return num > 0 && den > 0 ? num / den : null;
     }
     const den = S / M - eq;
-    return den > 0 ? S * (1 - r) / den : null; // den<=0 = equity หนาพอ ไม่โดน liq
+    return den > 0 ? (S * (1 - r) + extraUsd) / den : null; // den<=0 = BTC หนาพอ ไม่โดน liq
   }
   if (cat === "future") { // linear settle USDC
     const sum = sums[1];
@@ -824,7 +827,7 @@ function deribitLiqEstimate(p, cat, sums) {
 
 // what-if: จุด liq ถ้า order ฝั่งเพิ่ม position (instrument เดียวกัน) fill หมดทุกใบ
 // wallet balance คงเดิม, position รวมใหม่ = ของเดิม + ไม้ทุกใบที่ราคา limit, MMR ต่อ notional คงอัตราเดิม
-function deribitLiqAfterFills(p, cat, sums, rawOrders) {
+function deribitLiqAfterFills(p, cat, sums, rawOrders, extraUsd = 0) {
   const S = Math.abs(p.size), E = p.average_price, M = p.mark_price;
   if (!S || !E || !M) return null;
   const dirBuy = p.direction === "buy";
@@ -832,16 +835,19 @@ function deribitLiqAfterFills(p, cat, sums, rawOrders) {
     o.direction === p.direction && o.price > 0 && (o.amount - (o.filled_amount || 0)) > 0);
   if (!adds.length) return null;
   const sum = sums[cat === "inverse" ? 0 : 1];
-  if (!sum || !(sum.equity > 0)) return null;
-  const eqEff = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
+  if (!sum || !(sum.equity > 0 || (cat === "inverse" && extraUsd > 0))) return null;
+  const eqEff = (sum.equity || 0) - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
   if (cat === "inverse") {
     const r = p.maintenance_margin > 0 ? p.maintenance_margin * M / S : 0.005;
     const WB = eqEff - (dirBuy ? 1 : -1) * S * (1 / E - 1 / M); // ถอด uPnL ณ mark ออก
     let S2 = S, inv2 = S / E;
     adds.forEach(o => { const q = o.amount - (o.filled_amount || 0); S2 += q; inv2 += q / o.price; });
-    if (dirBuy) { const den = WB + inv2; return den > 0 ? S2 * (1 + r) / den : null; }
+    if (dirBuy) {
+      const num = S2 * (1 + r) - extraUsd, den = WB + inv2;
+      return num > 0 && den > 0 ? num / den : null;
+    }
     const den = inv2 - WB;
-    return den > 0 ? S2 * (1 - r) / den : null;
+    return den > 0 ? (S2 * (1 - r) + extraUsd) / den : null;
   }
   if (cat === "future") {
     const r = p.maintenance_margin > 0 ? p.maintenance_margin / (S * M) : 0.005;
@@ -860,15 +866,17 @@ async function refreshDeribit(acc) {
     acc.conn.rpc("private/get_positions", { currency: c }).catch(() => [])));
   const ordLists = await Promise.all(DERIBIT_CCY.map(c =>
     acc.conn.rpc("private/get_open_orders_by_currency", { currency: c }).catch(() => [])));
-  const sums = await Promise.all(["BTC", "USDC"].map(c =>
+  const sums = await Promise.all(["BTC", "USDC", "USDT"].map(c =>
     acc.conn.rpc("private/get_account_summary", { currency: c }).catch(() => null)));
   const rawOrders = ordLists.flat();
+  // หลักประกัน stablecoin ที่ค้ำ position BTC ได้ (บัญชี cross-collateral / PM) คิดเป็น USD
+  const extraUsd = Math.max(0, (sums[1] && sums[1].equity) || 0) + Math.max(0, (sums[2] && sums[2].equity) || 0);
 
   acc.positions = posLists.flat().filter(p => p.size !== 0).map(p => {
     const cat = deribitCat(p.instrument_name);
     let liq = p.estimated_liquidation_price || null, liqEst = false;
     if (!liq) {
-      liq = deribitLiqEstimate(p, cat, sums);
+      liq = deribitLiqEstimate(p, cat, sums, extraUsd);
       liqEst = !!liq;
     }
     return {
@@ -877,7 +885,7 @@ async function refreshDeribit(acc) {
       dirBuy: p.direction === "buy", size: Math.abs(p.size),
       entry: p.average_price, mark: p.mark_price,
       liq, liqEst,
-      liqFills: deribitLiqAfterFills(p, cat, sums, rawOrders),
+      liqFills: deribitLiqAfterFills(p, cat, sums, rawOrders, extraUsd),
       upnl: p.floating_profit_loss, upnlCcy: "",
     };
   });
@@ -890,11 +898,15 @@ async function refreshDeribit(acc) {
   acc.equityParts = [];
   if (sums[0]) acc.equityParts.push(`${fmt(sums[0].equity)} BTC`);
   if (sums[1] && sums[1].equity > 0.01) acc.equityParts.push(`${fmtP(sums[1].equity)} USDC`);
-  acc.mmPct = sums[0] && sums[0].equity > 0 && sums[0].maintenance_margin > 0
-    ? sums[0].maintenance_margin / sums[0].equity * 100 : null;
+  if (sums[2] && sums[2].equity > 0.01) acc.equityParts.push(`${fmtP(sums[2].equity)} USDT`);
+  // MM%/IM% เทียบกับหลักประกันรวม (BTC + stablecoin แปลงเป็น BTC ที่ mark ของ position inverse ตัวแรก)
+  const refMark = (posLists.flat().find(p => deribitCat(p.instrument_name) === "inverse" && p.mark_price) || {}).mark_price;
+  const eqTotalBtc = sums[0] ? (sums[0].equity || 0) + (refMark ? extraUsd / refMark : 0) : 0;
+  acc.mmPct = sums[0] && eqTotalBtc > 0 && sums[0].maintenance_margin > 0
+    ? sums[0].maintenance_margin / eqTotalBtc * 100 : null;
   // IM โชว์คู่ MM ไว้พิสูจน์ว่า order กระทบแค่ IM: ลอง วาง/ถอด order แล้ว IM ขยับ ส่วน MM (ตัวกำหนด liq) นิ่ง
-  acc.imPct = sums[0] && sums[0].equity > 0 && sums[0].initial_margin > 0
-    ? sums[0].initial_margin / sums[0].equity * 100 : null;
+  acc.imPct = sums[0] && eqTotalBtc > 0 && sums[0].initial_margin > 0
+    ? sums[0].initial_margin / eqTotalBtc * 100 : null;
   rebuildInstrumentSel();
   renderAll();
   refreshTradeMarkers(); // เผื่อมีไม้ fill ใหม่ระหว่างนี้
