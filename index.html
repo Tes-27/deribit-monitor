@@ -2462,7 +2462,10 @@ function boot() {
   accounts.forEach(startAccount);
 }
 
-function restartAll() { stopAll(); boot(); }
+function restartAll() {
+  payoffOff.clear(); // legKey อิง index ของพอร์ท — ตั้งค่าใหม่แล้ว index เลื่อนได้
+  stopAll(); boot();
+}
 
 document.getElementById("buildTag").textContent = "build " + BUILD;
 if (!cfg.accounts.length) {
