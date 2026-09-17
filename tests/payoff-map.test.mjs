@@ -296,6 +296,188 @@ test("end-to-end: long call ตอนหมดอายุได้ intrinsic/S 
   near(P.portfolioPnlUsd(legs, 60000, NOW, 0, { expiry: true }), -3 * 0.042 * 60000, 1e-9);
 });
 
+/* ==================== what-if: sanitizer ==================== */
+const wiOpt = o => Object.assign({
+  id: "w1", kind: "inv_opt", instrument: "BTC-25DEC26-100000-C", side: 1, qty: 0.3,
+  entryPrice: 0.05, strike: 100000, optType: "call", expiryTs: EXP_DEC26,
+  iv: 46.2, mark: null, fwdRatio: 1, fwdT0: null,
+}, o);
+const wiFut = o => Object.assign({
+  id: "f1", kind: "inv_fut", instrument: "BTC-PERPETUAL", side: -1, qty: 5000, entryPrice: 78000,
+}, o);
+const san = (list, now) => M.sanitizeWhatIf(list, { now: now == null ? NOW : now });
+const toLegs = (list, over) => M.whatIfToLegs(list, Object.assign(
+  { now: NOW, spot: SPOT, tickers: TICKERS, PB: P }, over || {}));
+
+test("sanitize: entry ปกติผ่านและถูก normalize เป็นตัวเลข", () => {
+  const r = san([wiOpt({ qty: "0.3", side: "1", strike: "100000" }), wiFut()]);
+  assert.equal(r.dropped, 0);
+  assert.equal(r.items.length, 2);
+  assert.equal(r.items[0].qty, 0.3);
+  assert.equal(r.items[0].side, 1);
+  assert.equal(r.items[0].strike, 100000);
+  assert.equal(r.items[1].kind, "inv_fut");
+  assert.equal(r.items[1].expiryTs, null);      // perp
+});
+
+test("sanitize: ทิ้ง entry ที่เสีย/ชนิดแปลก/id ซ้ำ", () => {
+  const bad = [
+    null, 42, "x", [], {},
+    wiOpt({ kind: "lin_opt" }),                  // kind ที่ไม่รองรับ
+    wiOpt({ kind: "toString" }),                 // ชื่อบน prototype ต้องไม่ผ่าน
+    wiOpt({ id: "" }), wiOpt({ id: 7 }),
+    wiOpt({ qty: 0 }), wiOpt({ qty: -1 }), wiOpt({ qty: "abc" }), wiOpt({ qty: Infinity }),
+    wiOpt({ entryPrice: 0 }), wiOpt({ entryPrice: null }),
+    wiOpt({ side: 0 }), wiOpt({ side: "long" }),
+    wiOpt({ strike: 0 }), wiOpt({ optType: "CALL" }), wiOpt({ expiryTs: null }),
+    wiOpt({ instrument: "" }), wiOpt({ instrument: 123 }),
+    wiOpt({ id: "dup" }), wiOpt({ id: "dup" }),  // ตัวหลังซ้ำ
+  ];
+  const r = san(bad);
+  assert.equal(r.items.length, 1, "ควรเหลือเฉพาะ id=dup ตัวแรก");
+  assert.equal(r.items[0].id, "dup");
+  assert.equal(r.dropped, bad.length - 1);
+  assert.deepEqual(san(null).items, []);         // ค่าที่ไม่ใช่ array
+  assert.deepEqual(san({ a: 1 }).items, []);
+});
+
+test("sanitize: ทิ้ง option ที่หมดอายุแล้ว (และ future ที่ dated หมดอายุ)", () => {
+  const r = san([wiOpt({ id: "old", expiryTs: NOW - 1 }), wiOpt({ id: "ok" }),
+                 wiFut({ id: "fold", expiryTs: NOW - 1 })]);
+  assert.deepEqual(r.items.map(i => i.id), ["ok"]);
+  assert.equal(r.dropped, 2);
+  // หมดอายุพอดี ณ now ก็ทิ้ง
+  assert.equal(san([wiOpt({ expiryTs: NOW })]).items.length, 0);
+});
+
+test("sanitize: instrument ที่มี HTML/quote ถูกทิ้ง ไม่หลุดเข้าไปในรายการ", () => {
+  const evil = [
+    wiOpt({ id: "e1", instrument: '<img src=x onerror=alert(1)>' }),
+    wiOpt({ id: "e2", instrument: 'BTC-25DEC26-100000-C"><script>alert(1)</script>' }),
+    wiOpt({ id: "e3", instrument: "BTC 25DEC26" }),
+    wiOpt({ id: "e4", optType: "<b>call</b>" }),
+  ];
+  const r = san(evil);
+  assert.equal(r.items.length, 0);
+  assert.equal(r.dropped, 4);
+  // id ก็ถูกจำกัดชุดอักขระ — ใช้เป็น data-id ใน HTML ได้
+  assert.equal(san([wiOpt({ id: '"><img>' })]).items.length, 0);
+  for (const it of san([wiOpt(), wiFut()]).items)
+    assert.ok(/^[A-Za-z0-9_-]+$/.test(it.id) && /^[A-Z0-9][A-Z0-9_.-]*$/.test(it.instrument));
+});
+
+test("sanitize: round-trip ผ่าน JSON (แบบที่เก็บลง localStorage) ได้ของเดิม", () => {
+  const items = san([wiOpt(), wiFut()]).items;
+  const back = san(JSON.parse(JSON.stringify(items)));
+  assert.equal(back.dropped, 0);
+  assert.deepEqual(back.items, items);
+});
+
+/* ==================== what-if: แปลงเป็น leg ==================== */
+test("what-if option → inv_opt ครบ field และ markOffset คาลิเบรตจาก ticker", () => {
+  const { legs, dropped } = toLegs([wiOpt({ qty: 0.3, entryPrice: 0.05 })]);
+  assert.equal(dropped, 0);
+  const l = legs[0];
+  assert.equal(l.kind, "inv_opt");
+  assert.equal(l.side, 1);
+  assert.equal(l.qty, 0.3);
+  assert.equal(l.entryPrice, 0.05);              // ราคาเข้าที่ผู้ใช้กำหนด
+  assert.equal(l.strike, 100000);
+  assert.equal(l.optType, "call");
+  assert.equal(l.expiryTs, EXP_DEC26);
+  assert.equal(l.whatIf, true);
+  assert.equal(l.enabled, true);
+  assert.equal(l.iv, 46.2);                      // จาก ticker สด
+  near(l.fwdRatio, FWD_DEC26 / 78000, 1e-12);
+  near(l.fwdT0, T_DEC26, 1e-12);
+  // เส้นโมเดลต้องผ่าน mark จริง เหมือนขา option ของ position จริง
+  near(P.optUnitValue(l, SPOT, T_DEC26, 1), MK_C_INV, 1e-12);
+  assert.ok(Math.abs(l.markOffset) <= 1e-4 + 1e-12);
+});
+
+test("what-if: ticker ที่ poll มาไม่ทับ entryPrice (ทับแค่ IV/forward/mark)", () => {
+  const it = wiOpt({ entryPrice: 0.011, iv: 12, fwdRatio: 1, fwdT0: null });
+  const l = toLegs([it]).legs[0];
+  assert.equal(l.entryPrice, 0.011);             // ≠ mark ของ ticker
+  assert.equal(l.mark, MK_C_INV);
+  assert.equal(l.iv, 46.2);
+  // ไม่มี ticker → ใช้ค่าที่เก็บไว้ตอนเพิ่มขา
+  const l2 = toLegs([wiOpt({ entryPrice: 0.011, iv: 12, fwdRatio: 1.02, fwdT0: 0.5, mark: null })],
+    { tickers: {} }).legs[0];
+  assert.equal(l2.entryPrice, 0.011);
+  assert.equal(l2.iv, 12);
+  assert.equal(l2.fwdRatio, 1.02);
+  assert.equal(l2.fwdT0, 0.5);
+  assert.equal(l2.markOffset, 0);                // ไม่มี mark ให้ยึด
+});
+
+test("what-if perp → inv_fut, qty เป็น USD, ไม่มี expiry/strike", () => {
+  const l = toLegs([wiFut({ side: -1, qty: 5000, entryPrice: 78000 })]).legs[0];
+  assert.equal(l.kind, "inv_fut");
+  assert.equal(l.side, -1);
+  assert.equal(l.qty, 5000);
+  assert.equal(l.entryPrice, 78000);
+  assert.equal(l.expiryTs, null);
+  assert.equal(l.strike, null);
+  assert.equal(l.markOffset, 0);
+  assert.equal(l.fwdRatio, 1);
+  near(P.legPnlUsd(l, 70000, null, 1), 5000 * (1 / 78000 - 1 / 70000) * -1 * 70000, 1e-9);
+});
+
+test("what-if: legKey ไม่ชนกับขาจริง และ id ต่อจากขาจริงได้", () => {
+  const real = run([DBT, BYB, PHX]);
+  const wi = toLegs([wiOpt({ id: "w1" }), wiFut({ id: "w2" })], { idStart: real.legs.length + 1 });
+  assert.equal(M.whatIfKeyOf("w1"), "whatif|w1");
+  const realKeys = new Set(real.legs.map(l => l.legKey));
+  wi.legs.forEach(l => assert.ok(!realKeys.has(l.legKey), "legKey ซ้ำกับขาจริง: " + l.legKey));
+  // accIdx ของขาจริงเป็นตัวเลขเสมอ จึงไม่มีทางสร้าง key ที่ขึ้นต้นด้วย "whatif|"
+  assert.ok([...realKeys].every(k => !k.startsWith("whatif|")));
+  const ids = real.legs.map(l => l.id).concat(wi.legs.map(l => l.id));
+  assert.equal(new Set(ids).size, ids.length, "id ต้องไม่ซ้ำ");
+  assert.deepEqual(wi.legs.map(l => l.id), [9, 10]);
+});
+
+test("what-if: disabled ผ่าน legKey ปิดขาได้เหมือนขาจริง", () => {
+  const wi = toLegs([wiOpt({ id: "w1" }), wiFut({ id: "w2" })],
+    { disabled: [M.whatIfKeyOf("w2")] });
+  assert.equal(wi.legs[0].enabled, true);
+  assert.equal(wi.legs[1].enabled, false);
+  assert.equal(P.portfolioPnlUsd(wi.legs, 90000, NOW, 0, {}),
+               P.legPnlUsd(wi.legs[0], 90000, P.tYears(wi.legs[0], NOW, 0), 1));
+});
+
+/* ==================== what-if: end-to-end รวมกับขาจริง ==================== */
+test("end-to-end: perp short จริง + what-if long call ตรงกับการคำนวณด้วยมือ", () => {
+  const acc = { idx: 0, name: "Main", exchange: "deribit", positions: [
+    pos({ symbol: "BTC-PERPETUAL", cat: "inverse", dirBuy: false, size: 23000, entry: 78000 }),
+  ] };
+  const real = run([acc], { tickers: {} });
+  // ไม่มี ticker/mark → markOffset = 0 จึงเทียบสูตร intrinsic ตรงๆ ได้
+  const wi = toLegs([wiOpt({ strike: 85000, qty: 0.3, entryPrice: 0.05, mark: null })],
+    { tickers: {} });
+  const legs = real.legs.concat(wi.legs);
+  assert.equal(legs.length, 2);
+
+  const S = 100000;
+  const pnlPerp = 23000 * (1 / 78000 - 1 / S) * S * -1;       // short: ราคาขึ้น = ขาดทุน
+  const unit = (S - 85000) / S;                               // BTC/สัญญา ตอนหมดอายุ
+  const pnlCall = 1 * 0.3 * (unit - 0.05) * S;                // legPnlUsd ของ inv_opt
+  near(pnlPerp, -6487.1794, 1e-3);
+  near(pnlCall, 3000, 1e-9);
+  near(P.portfolioPnlUsd(legs, S, NOW, 0, { expiry: true }), pnlPerp + pnlCall, 1e-6);
+  near(P.portfolioPnlUsd(legs, S, NOW, 0, { expiry: true }), -3487.1794, 1e-3);
+
+  // call หมดค่าตอน S ต่ำ → เหลือกำไร short หักค่า premium
+  const S2 = 60000;
+  near(P.portfolioPnlUsd(legs, S2, NOW, 0, { expiry: true }),
+       23000 * (1 / 78000 - 1 / S2) * S2 * -1 - 0.3 * 0.05 * S2, 1e-6);
+  // Greeks/เส้นรวมยังคำนวณได้ครบ
+  const g = P.portfolioGreeks(legs, SPOT, NOW, 0);
+  assert.ok(["delta", "gammaPer1Pct", "vega", "theta"].every(k => isFinite(g[k])));
+  const st = P.curveStats(s => P.portfolioPnlUsd(legs, s, NOW, 0, { expiry: true }), 40000, 160000, 800);
+  assert.ok(st.breakevens.length >= 1);
+});
+
 /* ---------- สรุป ---------- */
 const w = Math.max(...results.map(r => r[1].length));
 for (const [mark, name, err] of results)
