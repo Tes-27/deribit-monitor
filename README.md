@@ -19,6 +19,7 @@
 - แยกหมวด **Future Inverse / Future / Option / Spot** ทั้งใน dropdown และตาราง position
 - ระยะห่างจาก liquidation เป็น % (เตือนสีแดงเมื่อใกล้กว่า 10%) + MM ratio ต่อพอร์ท
 - อัปเดต real-time ผ่าน WebSocket, คลิกแถว position/order เพื่อสลับกราฟ
+- หมวด **Deribit · Option** ใน dropdown: option ที่ถือ position/มี order ขึ้นให้เอง + รายการ "➕ เลือก option…" (expiry → strike → Call/Put) เปิดกราฟ option ตัวไหนก็ได้ และจำตัวที่เปิดล่าสุดไว้
 - ปุ่ม **📈 Payoff** — กราฟ payoff ของ position ที่เปิดอยู่ (เส้นวันหมดอายุ + T+0, breakeven, จุด liq, delta/gamma/vega/theta) ใช้เครื่องคิดเลขชุดเดียวกับ deribit-position-builder · เพิ่ม **ขา what-if** (option BTC / perp ของ Deribit) ทับ position จริงเพื่อลองแผนก่อนเทรดได้
 - read-only 100% — ไม่มีโค้ดส่งออเดอร์
 

@@ -102,11 +102,12 @@
   tr[data-inst] { cursor: pointer; }
   tr[data-inst]:hover td { background: #222736; }
   .empty { color: var(--muted); padding: 6px 0; }
-  #modal {
+  #modal, #optPickModal {
     position: fixed; inset: 0; background: rgba(0,0,0,.6);
     display: none; align-items: center; justify-content: center; z-index: 50;
   }
-  #modal.show { display: flex; }
+  #modal.show, #optPickModal.show { display: flex; }
+  #optPickModal select { width: 100%; margin: 4px 0 10px; }
   .modal-box {
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     padding: 22px; width: 680px; max-width: 96vw; max-height: 88vh; overflow-y: auto;
@@ -220,6 +221,26 @@
     <div class="modal-actions">
       <button id="btnCancel">ปิด</button>
       <button id="btnSave" class="btn-primary">บันทึก & เชื่อมต่อ</button>
+    </div>
+  </div>
+</div>
+
+<div id="optPickModal">
+  <div class="modal-box" style="width:400px">
+    <h2>เลือก Option ของ Deribit (BTC)</h2>
+    <p>เปิดกราฟ option ตัวไหนก็ได้ — ตัวที่เปิดล่าสุดจะถูกจำไว้ใน dropdown ส่วน option ที่คุณถือ position/มี order อยู่จะขึ้นให้เองเสมอ</p>
+    <label class="lbl">Expiry</label>
+    <select id="optPickExpiry"></select>
+    <label class="lbl">Strike</label>
+    <select id="optPickStrike"></select>
+    <div class="tf-group" style="margin:2px 0">
+      <button id="optPickCall" class="active">Call</button>
+      <button id="optPickPut">Put</button>
+    </div>
+    <div id="optPickStatus" class="lbl" style="margin-top:8px"></div>
+    <div class="modal-actions">
+      <button id="optPickCancel">ปิด</button>
+      <button id="optPickGo" class="btn-primary">เปิดกราฟ</button>
     </div>
   </div>
 </div>
@@ -976,7 +997,7 @@ root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, 
 <script>
 "use strict";
 
-const BUILD = "2026-09-17b"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-17c"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -1991,12 +2012,28 @@ function dynamicOptions(ex) { // option instruments จาก position/order ท
   return [...s].sort();
 }
 
+// option ที่เคยเปิดจากตัวเลือก — จำไว้ให้กลับมาเปิดซ้ำได้จาก dropdown (ตัดตัวที่หมดอายุทิ้ง)
+const PICK_OPTION = "__pick_option__";
+const RECENT_OPT_KEY = "deribit_monitor_recent_opts";
+const RECENT_OPT_RE = /^BTC-\d{1,2}[A-Z]{3}\d{2}-\d+(\.\d+)?-[CP]$/;
+function recentOptions() {
+  let raw;
+  try { raw = JSON.parse(store.get(RECENT_OPT_KEY) || "[]"); } catch { raw = []; }
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(n => typeof n === "string" && RECENT_OPT_RE.test(n)
+    && (PayoffMap.parseDeribit(n).expiryTs || 0) > Date.now()).slice(0, 6);
+}
+function rememberOption(name) {
+  if (!RECENT_OPT_RE.test(name)) return;
+  store.set(RECENT_OPT_KEY, JSON.stringify([name, ...recentOptions().filter(n => n !== name)].slice(0, 6)));
+}
+
 function rebuildInstrumentSel() {
   const sel = document.getElementById("instrumentSel");
   const groups = [
     ["Deribit · Future Inverse", "deribit", "inverse", deribitGroups.inverse],
     ["Deribit · Future", "deribit", "future", deribitGroups.future],
-    ["Deribit · Option", "deribit", "option", dynamicOptions("deribit")],
+    ["Deribit · Option", "deribit", "option", [...new Set([...dynamicOptions("deribit"), ...recentOptions()])]],
     ["Deribit · Spot", "deribit", "spot", deribitGroups.spot],
     ["Bybit · Future Inverse", "bybit", "inverse", bybitGroups.inverse],
     ["Bybit · Future", "bybit", "future", bybitGroups.future],
@@ -2016,14 +2053,17 @@ function rebuildInstrumentSel() {
     const g = groups.find(([, ex, cat]) => ex === cur.ex && cat === cur.cat);
     if (g) g[3].unshift(cur.sym);
   }
+  const isPickGroup = (ex, cat) => ex === "deribit" && cat === "option"; // หมวดนี้แสดงเสมอ (มีทางเข้าตัวเลือก)
   sel.innerHTML = groups
-    .filter(([, , , list]) => list.length)
+    .filter(([, ex, cat, list]) => list.length || isPickGroup(ex, cat))
     .map(([label, ex, cat, list]) =>
       `<optgroup label="${label}">` +
       list.map(sym => {
         const k = ikey(ex, cat, sym);
         return `<option value="${esc(k)}"${k === instrument ? " selected" : ""}>${esc(sym)}</option>`;
-      }).join("") + `</optgroup>`
+      }).join("") +
+      (isPickGroup(ex, cat) ? `<option value="${PICK_OPTION}">➕ เลือก option…</option>` : "") +
+      `</optgroup>`
     ).join("");
 }
 
@@ -2714,7 +2754,10 @@ wiEl("btnWiToggle").onclick = async () => {
   f.classList.toggle("hide");
   if (f.classList.contains("hide")) return;
   wiSyncForm();
-  if (wiChain) return;
+  if (wiChain) { // chain อาจถูกโหลดมาก่อนจากตัวเลือก option ของ dropdown — ต้องเติมรายการให้ฟอร์มด้วย
+    if (!wiEl("wiExpiry").options.length) { wiRebuildExpiry(); wiSyncForm(); }
+    return;
+  }
   wiStatus("กำลังโหลดรายการสัญญา…");
   try {
     await wiEnsureChain();
@@ -2833,10 +2876,71 @@ document.getElementById("tfGroup").addEventListener("click", e => {
 });
 
 document.getElementById("instrumentSel").addEventListener("change", e => {
+  if (e.target.value === PICK_OPTION) { // ไม่ใช่ instrument จริง — คืนค่าเดิมแล้วเปิดตัวเลือก
+    rebuildInstrumentSel();
+    optPickOpen();
+    return;
+  }
   instrument = e.target.value;
   store.set("deribit_monitor_instrument", instrument);
   loadChart().catch(console.error);
 });
+
+/* ---------- ตัวเลือก option ของ Deribit (เปิดกราฟ option ตัวไหนก็ได้) ---------- */
+let optPickCP = "C";
+const optPickEl = id => document.getElementById(id);
+function optPickSetCP(cp) {
+  optPickCP = cp;
+  optPickEl("optPickCall").classList.toggle("active", cp === "C");
+  optPickEl("optPickPut").classList.toggle("active", cp === "P");
+}
+function optPickFillStrikes() {
+  const ts = Number(optPickEl("optPickExpiry").value);
+  const strikes = [...new Set(wiChain.opt.filter(i => Number(i.expiration_timestamp) === ts)
+    .map(i => Number(i.strike)))].sort((a, b) => a - b);
+  const ref = payoffSpotValue() || lastPrice;
+  let nearest = strikes[0];
+  if (ref > 1000) strikes.forEach(s => { if (Math.abs(s - ref) < Math.abs(nearest - ref)) nearest = s; });
+  optPickEl("optPickStrike").innerHTML = strikes.map(s =>
+    `<option value="${s}"${s === nearest ? " selected" : ""}>${s.toLocaleString("en-US")}${
+      s === nearest && ref > 1000 ? " (ใกล้ราคาปัจจุบัน)" : ""}</option>`).join("");
+}
+async function optPickOpen() {
+  const st = optPickEl("optPickStatus");
+  optPickEl("optPickModal").classList.add("show");
+  st.textContent = "กำลังโหลดรายชื่อ option…";
+  try {
+    await wiEnsureChain();
+    const now = Date.now();
+    const exps = [...new Set(wiChain.opt.map(i => Number(i.expiration_timestamp)))].sort((a, b) => a - b);
+    optPickEl("optPickExpiry").innerHTML = exps.map(ts => {
+      const nm = wiChain.opt.find(i => Number(i.expiration_timestamp) === ts).instrument_name.split("-")[1] || "";
+      return `<option value="${ts}">${esc(nm)} (${((ts - now) / 86400000).toFixed(0)} วัน)</option>`;
+    }).join("");
+    optPickFillStrikes();
+    st.textContent = "";
+  } catch (err) {
+    st.textContent = "โหลดไม่สำเร็จ: " + (err.message || err);
+  }
+}
+optPickEl("optPickExpiry").addEventListener("change", optPickFillStrikes);
+optPickEl("optPickCall").onclick = () => optPickSetCP("C");
+optPickEl("optPickPut").onclick = () => optPickSetCP("P");
+optPickEl("optPickCancel").onclick = () => optPickEl("optPickModal").classList.remove("show");
+optPickEl("optPickGo").onclick = () => {
+  if (!wiChain) return;
+  const ts = Number(optPickEl("optPickExpiry").value), k = Number(optPickEl("optPickStrike").value);
+  const want = optPickCP === "C" ? "call" : "put";
+  const inst = wiChain.opt.find(i => Number(i.expiration_timestamp) === ts
+    && Number(i.strike) === k && i.option_type === want);
+  if (!inst) { optPickEl("optPickStatus").textContent = "ไม่มีสัญญานี้ในกระดาน"; return; }
+  instrument = ikey("deribit", "option", inst.instrument_name);
+  store.set("deribit_monitor_instrument", instrument);
+  rememberOption(inst.instrument_name);
+  optPickEl("optPickModal").classList.remove("show");
+  rebuildInstrumentSel();
+  loadChart().catch(console.error);
+};
 
 document.querySelector("footer").addEventListener("click", e => {
   const row = e.target.closest("[data-inst]");
