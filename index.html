@@ -131,6 +131,27 @@
   .btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
   .warn { background: #2b2416; border: 1px solid #5c4a1e; border-radius: 6px;
           padding: 8px 10px; font-size: 12px; color: #e0c060; margin-top: 12px; line-height: 1.6; }
+  /* ---- payoff panel ---- */
+  #payoffModal {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: center; justify-content: center; z-index: 60;
+  }
+  #payoffModal.show { display: flex; }
+  .payoff-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; width: 1240px; max-width: 97vw; max-height: 94vh; overflow-y: auto;
+  }
+  .payoff-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .payoff-head h2 { font-size: 16px; }
+  #payoffSvg { width: 100%; height: auto; display: block; margin-top: 6px; }
+  #payoffSvg text { fill: var(--muted); font-size: 11px;
+                    font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #payoffRange { width: 150px; }
+  .pf-sum { display: flex; gap: 18px; flex-wrap: wrap; padding: 8px 0;
+            border-top: 1px solid var(--border); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .pf-note { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.6; }
+  .pf-legs td, .pf-legs th { padding: 3px 12px 3px 0; }
+  .pf-legs input[type=checkbox] { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -143,6 +164,7 @@
   <span id="liqDistance" class="lbl"></span>
   <div class="spacer"></div>
   <span id="connDot"></span><span id="connLabel">offline</span>
+  <button id="btnPayoff">📈 Payoff</button>
   <button id="btnSettings">⚙ ตั้งค่า</button>
 </header>
 
@@ -178,10 +200,616 @@
   </div>
 </div>
 
+<div id="payoffModal">
+  <div class="payoff-box">
+    <div class="payoff-head">
+      <h2>📈 Payoff</h2>
+      <span id="payoffScope" class="lbl"></span>
+      <div class="spacer"></div>
+      <div class="tf-group" id="payoffDenom">
+        <button data-denom="USD" class="active">USD</button>
+        <button data-denom="BTC">BTC</button>
+      </div>
+      <label class="lbl" for="payoffRange">ช่วงราคา</label>
+      <input type="range" id="payoffRange" min="5" max="90" step="5" value="35">
+      <span id="payoffRangeVal" class="lbl">±35%</span>
+      <button id="btnPayoffClose">ปิด</button>
+    </div>
+    <div id="payoffStatus" class="pf-note"></div>
+    <svg id="payoffSvg" viewBox="0 0 1180 430"></svg>
+    <div id="payoffSummary"></div>
+    <div id="payoffLegs"></div>
+    <div id="payoffExcluded"></div>
+  </div>
+</div>
+
+<script id="pb-core">
+"use strict";
+/* =========================================================================
+   pb-core — คณิตศาสตร์ล้วน ไม่แตะ DOM (ถูกดึงไปรันใน tests/run-tests.mjs)
+   ========================================================================= */
+(function (root) {
+
+const YEAR_MS = 365 * 24 * 3600 * 1000;
+const DAY_MS = 86400000;
+
+/* ---------- ค่าคงที่ margin ---------- */
+function defaultConfig() {
+  return {
+    sm: {
+      // inverse futures/perp: rate = base + sizeRate × (ขนาด BTC / sizeUnit)
+      futImBase: 0.02, futMmBase: 0.01, futSizeRate: 0.005, futSizeUnit: 100,
+      // linear (USDC) futures/perp — โครงสร้างเดียวกัน คิดเป็น USDC
+      linFutImBase: 0.02, linFutMmBase: 0.01, linFutSizeRate: 0.005, linFutSizeUnit: 100,
+      // short option
+      optImOtm: 0.15, optImFloor: 0.10, optMmBase: 0.075,
+    },
+    pm: {
+      priceRange: 0.15, priceSteps: 11,
+      volRangeUp: 0.45, volRangeDown: 0.30,
+      shortTermVegaPower: 0.3, longTermVegaPower: 0.13, vegaPowerSplitDays: 30,
+      futContingency: 0.006, optSumContingency: 0.01, atmRange: 0.10,
+      imFactor: 1.2,
+      extended: false,
+      extendedShocks: [-0.66, -0.33, 0.5, 1, 2, 3, 4, 5],
+    },
+  };
+}
+
+/* ---------- utils ---------- */
+function bisect(f, lo, hi, iters) {
+  iters = iters || 120;
+  let flo = f(lo), fhi = f(hi);
+  if (!isFinite(flo) || !isFinite(fhi) || flo * fhi > 0) return NaN;
+  for (let i = 0; i < iters; i++) {
+    const mid = (lo + hi) / 2, fm = f(mid);
+    if (!isFinite(fm)) return NaN;
+    if (flo * fm <= 0) { hi = mid; fhi = fm; } else { lo = mid; flo = fm; }
+  }
+  return (lo + hi) / 2;
+}
+
+/* ---------- Black-76 (r = 0, F = S) ---------- */
+function erf(x) {
+  const s = x < 0 ? -1 : 1; x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return s * y;
+}
+const ncdf = x => 0.5 * (1 + erf(x / Math.SQRT2));
+
+function black76Usd(F, K, T, sigma, isCall) {
+  if (!(F > 0) || !(K > 0)) return NaN;
+  const intrinsic = isCall ? Math.max(F - K, 0) : Math.max(K - F, 0);
+  if (!(T > 0) || !(sigma > 0)) return intrinsic;
+  const sq = sigma * Math.sqrt(T);
+  const d1 = (Math.log(F / K) + 0.5 * sigma * sigma * T) / sq;
+  const d2 = d1 - sq;
+  return isCall ? F * ncdf(d1) - K * ncdf(d2)
+                : K * ncdf(-d2) - F * ncdf(-d1);
+}
+/* mark ของ inverse option = ราคา USD / underlying (quote เป็น BTC) */
+const markBtc = (F, K, T, sigma, isCall) => black76Usd(F, K, T, sigma, isCall) / F;
+
+/* ---------- leg helpers ---------- */
+const isOption = leg => leg.kind === 'inv_opt' || leg.kind === 'lin_opt';
+const isInverse = leg => leg.kind === 'inv_opt' || leg.kind === 'inv_fut';
+
+/** เวลาถึงหมดอายุ (ปี) — null ถ้าเป็น perpetual */
+function tYears(leg, nowMs, daysFwd) {
+  if (leg.expiryTs == null) return null;
+  return Math.max(0, leg.expiryTs - nowMs - (daysFwd || 0) * DAY_MS) / YEAR_MS;
+}
+
+/** ขนาด position คิดเป็น BTC (ใช้กับ margin/contingency) */
+function legSizeBtc(leg, S) {
+  switch (leg.kind) {
+    case 'inv_fut': return Math.abs(leg.qty) / S;
+    case 'lin_fut': return Math.abs(leg.qty);
+    default: return Math.abs(leg.qty);
+  }
+}
+
+/**
+ * อัตราส่วน forward/index ที่เวลาเหลือ T
+ * Deribit ตั้งราคา option บน forward ซึ่งต่างจาก index ได้หลาย % ในสัญญาไกล
+ * carry แปรตามเวลา → สลายเป็นเส้นตรงเข้าหา 1 (ตอนหมดอายุ forward = index เสมอ)
+ */
+function fwdRatioAt(leg, T) {
+  const r = leg.fwdRatio;
+  if (r == null || r === 1 || !(T > 0) || !(leg.fwdT0 > 0)) return 1;
+  return 1 + (r - 1) * Math.min(1, T / leg.fwdT0);
+}
+
+/**
+ * มูลค่าต่อ 1 หน่วยของ option ในหน่วยราคาของสัญญานั้น
+ * inv_opt → BTC/สัญญา, lin_opt → USDC/สัญญา
+ *
+ * inverse option ของ Deribit quote เป็น BTC โดยหารด้วย "forward" ไม่ใช่ index
+ * (ตรวจกับ mark จริง: ถ้าหารด้วย index สัญญาอายุ 300 วันจะเพี้ยนเท่ากับ basis พอดี)
+ * ตอนหมดอายุ forward = index อยู่แล้ว จึงได้ intrinsic/S ตามสัญญาจริง
+ */
+function optUnitValue(leg, S, T, ivMult) {
+  const iv = (leg.iv / 100) * (ivMult == null ? 1 : ivMult);
+  const isCall = leg.optType === 'call';
+  const F = S * fwdRatioAt(leg, T);
+  const usd = black76Usd(F, leg.strike, T, iv, isCall);
+  const raw = leg.kind === 'inv_opt' ? usd / F : usd;
+  return raw + (leg.markOffset || 0);
+}
+
+/**
+ * PnL ของขาเดียว หน่วย USD
+ * @param T  เวลาถึงหมดอายุเป็นปี (0 = ตอนหมดอายุ, null = perpetual)
+ */
+function legPnlUsd(leg, S, T, ivMult) {
+  if (!(S > 0)) return NaN;
+  const s = leg.side;
+  const F = S * fwdRatioAt(leg, T);
+  switch (leg.kind) {
+    // inverse: PnL(BTC) = side × N_usd × (1/entry − 1/F) → ×S (index) เป็น USD
+    case 'inv_fut': return s * leg.qty * (1 / leg.entryPrice - 1 / F) * S;
+    case 'lin_fut': return s * leg.qty * (F - leg.entryPrice);
+    case 'inv_opt': return s * leg.qty * (optUnitValue(leg, S, T, ivMult) - leg.entryPrice) * S;
+    case 'lin_opt': return s * leg.qty * (optUnitValue(leg, S, T, ivMult) - leg.entryPrice);
+    default: return NaN;
+  }
+}
+
+/** PnL รวมทั้งพอร์ต หน่วย USD */
+function portfolioPnlUsd(legs, S, nowMs, daysFwd, opts) {
+  opts = opts || {};
+  let sum = 0;
+  for (const leg of legs) {
+    if (leg.enabled === false) continue;
+    const T = opts.expiry ? 0 : tYears(leg, nowMs, daysFwd);
+    sum += legPnlUsd(leg, S, T, opts.ivMult);
+  }
+  return sum;
+}
+
+/**
+ * ตรวจว่าเส้น payoff ลู่ออก (ไม่จำกัด) ที่ปลายข้างไหนบ้าง — ตรวจจากค่าจริงของ f
+ * จึงถูกต้องทั้งหน่วย USD และ BTC (long call ไม่จำกัดใน USD แต่ลู่เข้าใน BTC)
+ * @returns {upDir, downDir} 0 = ลู่เข้า, +1 = ไป +∞, −1 = ไป −∞
+ */
+function tailFlags(f, lo, hi, refScale) {
+  const eps = Math.max(refScale * 1e-3, 1e-12);
+  const diverges = (a, b, c) => {
+    if (![a, b, c].every(isFinite)) return 0;
+    const d1 = b - a, d2 = c - b;
+    // ลู่ออกเมื่อผลต่างไม่หด: เส้นตรงได้ d2 = d1, เส้นลู่เข้าได้ d2 → 0
+    return (Math.abs(d2) > eps && Math.abs(d2) >= Math.abs(d1) * 0.8) ? Math.sign(d2) : 0;
+  };
+  return {
+    upDir: diverges(f(hi * 2), f(hi * 4), f(hi * 8)),
+    downDir: diverges(f(lo / 2), f(lo / 4), f(lo / 8)),
+  };
+}
+
+/* ---------- หา breakeven / max P&L ---------- */
+/** หา root ของ f บน [lo,hi] ด้วย grid + bisect */
+function findRoots(f, lo, hi, n) {
+  n = n || 800;
+  const roots = [];
+  let xPrev = lo, fPrev = f(lo);
+  if (fPrev === 0) roots.push(lo);
+  for (let i = 1; i <= n; i++) {
+    const x = lo + (hi - lo) * i / n;
+    const fx = f(x);
+    if (isFinite(fPrev) && isFinite(fx)) {
+      // ค่าเป็นศูนย์ตรงจุด grid พอดี — sign change ตรวจไม่เจอ ต้องเก็บเอง
+      // (เก็บเฉพาะจุดแรกของช่วง เพื่อไม่ให้เส้นที่ราบอยู่ที่ศูนย์กลายเป็นรากเต็มไปหมด)
+      if (fx === 0) { if (fPrev !== 0) roots.push(x); }
+      else if (fPrev !== 0 && fPrev * fx < 0) {
+        const r = bisect(f, xPrev, x, 80);
+        if (isFinite(r)) roots.push(r);
+      }
+    }
+    xPrev = x; fPrev = fx;
+  }
+  // ตัดค่าซ้ำ
+  const eps = (hi - lo) * 1e-6;
+  return roots.filter((r, i) => i === 0 || Math.abs(r - roots[i - 1]) > eps);
+}
+
+/**
+ * สถิติของเส้น payoff
+ * @returns {breakevens, maxProfit, maxLoss, maxProfitAt, maxLossAt, unboundedUp, unboundedDown}
+ */
+function curveStats(f, lo, hi, n) {
+  n = n || 800;
+  const breakevens = findRoots(f, lo, hi, n);
+  let maxP = -Infinity, maxL = Infinity, atP = NaN, atL = NaN, scale = 0;
+  for (let i = 0; i <= n; i++) {
+    const x = lo + (hi - lo) * i / n;
+    const y = f(x);
+    if (!isFinite(y)) continue;
+    if (y > maxP) { maxP = y; atP = x; }
+    if (y < maxL) { maxL = y; atL = x; }
+    if (Math.abs(y) > scale) scale = Math.abs(y);
+  }
+  const t = tailFlags(f, lo, hi, scale);
+  const unboundedUp = t.upDir > 0 || t.downDir > 0;
+  const unboundedDown = t.upDir < 0 || t.downDir < 0;
+  return {
+    breakevens,
+    maxProfit: unboundedUp ? null : (isFinite(maxP) ? maxP : null),
+    maxLoss: unboundedDown ? null : (isFinite(maxL) ? maxL : null),
+    maxProfitAt: atP, maxLossAt: atL,
+    unboundedUp, unboundedDown,
+  };
+}
+
+/* ---------- Greeks (finite difference บนพอร์ตรวม) ---------- */
+function portfolioGreeks(legs, S, nowMs, daysFwd) {
+  const F = (s, ls, dFwd) => portfolioPnlUsd(ls || legs, s, nowMs, dFwd == null ? daysFwd : dFwd, {});
+  const h = Math.max(S * 1e-4, 0.01);
+  const v0 = F(S), vUp = F(S + h), vDn = F(S - h);
+  const delta = (vUp - vDn) / (2 * h);                 // BTC ที่ได้/เสียต่อ BTC ที่ราคาขยับ
+  const gamma = (vUp - 2 * v0 + vDn) / (h * h);        // ต่อ $1²
+  // vega: ขยับ IV เป็น "จุด" (absolute vol point) แบบที่เทรดเดอร์คิด ไม่ใช่ relative
+  const shiftIv = pts => legs.map(l => isOption(l) ? Object.assign({}, l, { iv: l.iv + pts }) : l);
+  const vega = F(S, shiftIv(0.5)) - F(S, shiftIv(-0.5));
+  const theta = F(S, null, (daysFwd || 0) + 1) - v0;   // USD ต่อ 1 วัน
+  return {
+    delta,
+    gammaPer1Pct: gamma * S / 100,                     // Δ เปลี่ยนไปเท่าไรเมื่อราคาขยับ 1%
+    vega, theta,
+  };
+}
+
+/* ---------- Standard Margin ---------- */
+function smMargin(legs, S, nowMs, daysFwd, cfg) {
+  const c = cfg.sm;
+  const out = { btc: { im: 0, mm: 0 }, usdc: { im: 0, mm: 0 }, perLeg: [] };
+  for (const leg of legs) {
+    if (leg.enabled === false) continue;
+    let im = 0, mm = 0, cur = isInverse(leg) ? 'btc' : 'usdc';
+    if (leg.kind === 'inv_fut') {
+      const sizeBtc = Math.abs(leg.qty) / S;
+      const add = c.futSizeRate * (sizeBtc / c.futSizeUnit);
+      im = (c.futImBase + add) * sizeBtc;
+      mm = (c.futMmBase + add) * sizeBtc;
+    } else if (leg.kind === 'lin_fut') {
+      const sizeBtc = Math.abs(leg.qty);
+      const add = c.linFutSizeRate * (sizeBtc / c.linFutSizeUnit);
+      im = (c.linFutImBase + add) * sizeBtc * S;
+      mm = (c.linFutMmBase + add) * sizeBtc * S;
+    } else if (isOption(leg)) {
+      if (leg.side > 0) { im = 0; mm = 0; }            // long: จ่าย premium ไปแล้ว
+      else {
+        const T = tYears(leg, nowMs, daysFwd);
+        const isCall = leg.optType === 'call';
+        const otmUsd = isCall ? Math.max(leg.strike - S, 0) : Math.max(S - leg.strike, 0);
+        const otmFrac = otmUsd / S;
+        const imRate = Math.max(c.optImOtm - otmFrac, c.optImFloor);
+        if (leg.kind === 'inv_opt') {
+          const mk = optUnitValue(leg, S, T, 1);                      // BTC/สัญญา
+          const imUnit = imRate + mk;
+          const mmUnit = isCall ? (c.optMmBase + mk)
+                                : (Math.max(c.optMmBase, c.optMmBase * mk) + mk);
+          im = imUnit * Math.abs(leg.qty);
+          mm = mmUnit * Math.abs(leg.qty);
+        } else {
+          const mk = optUnitValue(leg, S, T, 1);                      // USDC/สัญญา
+          const imUnit = imRate * S + mk;
+          const mmUnit = isCall ? (c.optMmBase * S + mk)
+                                : (Math.max(c.optMmBase * S, c.optMmBase * mk) + mk);
+          im = imUnit * Math.abs(leg.qty);
+          mm = mmUnit * Math.abs(leg.qty);
+        }
+      }
+    }
+    out[cur].im += im; out[cur].mm += mm;
+    out.perLeg.push({ id: leg.id, currency: cur, im: im, mm: mm });
+  }
+  out.imUsd = out.btc.im * S + out.usdc.im;
+  out.mmUsd = out.btc.mm * S + out.usdc.mm;
+  return out;
+}
+
+/* ---------- Portfolio Margin (PME risk matrix) ---------- */
+/** ตัวคูณ IV ที่ถูกช็อก: 1 + range × (30 / วันคงเหลือ)^vegaPower */
+function ivShockMult(dteDays, dir, pm) {
+  if (dir === 0) return 1;
+  const range = dir > 0 ? pm.volRangeUp : -pm.volRangeDown;
+  const d = Math.max(dteDays, 1 / 24);
+  const power = d < pm.vegaPowerSplitDays ? pm.shortTermVegaPower : pm.longTermVegaPower;
+  return 1 + range * Math.pow(pm.vegaPowerSplitDays / d, power);
+}
+
+/** ราคาที่ช็อกทั้งหมด (สัดส่วน) เรียงจากน้อยไปมาก */
+function pmPriceShocks(pm) {
+  const n = Math.max(3, pm.priceSteps | 0);
+  const list = [];
+  for (let i = 0; i < n; i++) list.push(-pm.priceRange + 2 * pm.priceRange * i / (n - 1));
+  if (pm.extended) for (const s of pm.extendedShocks) list.push(s);
+  return list.sort((a, b) => a - b);
+}
+
+/**
+ * Contingency ของ options: 0.01 BTC ต่อ net short 1 สัญญา ต่อ strike
+ * - ปรับ position ที่อยู่ในช่วง ATM (±10%) ตามระยะห่างจาก ATM
+ * - net long ที่ strike หนึ่ง หักล้างกับ net short ที่ OTM ไกลกว่าได้ (roll ออกจาก ATM)
+ */
+function optionContingencyBtc(legs, S, pm) {
+  const byStrike = new Map();
+  for (const leg of legs) {
+    if (leg.enabled === false || !isOption(leg)) continue;
+    const k = leg.strike;
+    byStrike.set(k, (byStrike.get(k) || 0) + leg.side * Math.abs(leg.qty));
+  }
+  if (!byStrike.size) return 0;
+
+  const adj = [];
+  for (const [k, pos] of byStrike) {
+    let p = pos;
+    if (S * (1 - pm.atmRange) < k && k < S * (1 + pm.atmRange)) {
+      p = pos * Math.abs(S - k) / (S * pm.atmRange);
+    }
+    adj.push({ k: k, pos: p });
+  }
+  // roll ออกจาก ATM ทั้งสองทาง: strike ≥ spot ไล่ขึ้น, strike < spot ไล่ลง
+  const roll = arr => {
+    let carry = 0, shortSum = 0;
+    for (const it of arr) {
+      const net = it.pos + carry;
+      if (net > 0) carry = net;
+      else { carry = 0; shortSum += net; }
+    }
+    return shortSum;                       // ค่าติดลบ
+  };
+  const up = adj.filter(a => a.k >= S).sort((a, b) => a.k - b.k);
+  const dn = adj.filter(a => a.k < S).sort((a, b) => b.k - a.k);
+  return Math.abs(roll(up) + roll(dn)) * pm.optSumContingency;
+}
+
+/** Contingency ของ futures: 0.6% ของขนาด futures รวม (absolute) เป็น BTC */
+function futuresContingencyBtc(legs, S, pm) {
+  let total = 0;
+  for (const leg of legs) {
+    if (leg.enabled === false || isOption(leg)) continue;
+    total += legSizeBtc(leg, S);
+  }
+  return total * pm.futContingency;
+}
+
+/**
+ * Portfolio Margin
+ * MM = |ขาดทุนแย่สุดใน risk matrix| + contingency ; IM = MM × imFactor
+ * PnL ในตารางวัดเทียบกับ "มูลค่าปัจจุบัน" ไม่ใช่ราคาเข้า
+ */
+function pmMargin(legs, S, nowMs, daysFwd, cfg) {
+  const pm = cfg.pm;
+  const active = legs.filter(l => l.enabled !== false);
+  const base = portfolioPnlUsd(active, S, nowMs, daysFwd, {});
+  const shocks = pmPriceShocks(pm);
+  const volDirs = [-1, 0, 1];
+
+  // ivMult ต่อขา (ขึ้นกับวันคงเหลือของขานั้น) → ใช้ per-leg แทน global
+  const pnlAt = (shock, volDir) => {
+    const S2 = S * (1 + shock);
+    let sum = 0;
+    for (const leg of active) {
+      let mult = 1;
+      if (isOption(leg)) {
+        const dte = leg.expiryTs == null ? pm.vegaPowerSplitDays
+                  : Math.max(0, leg.expiryTs - nowMs - (daysFwd || 0) * DAY_MS) / DAY_MS;
+        mult = ivShockMult(dte, volDir, pm);
+      }
+      sum += legPnlUsd(leg, S2, tYears(leg, nowMs, daysFwd), mult);
+    }
+    return sum - base;
+  };
+
+  const grid = [];
+  let worst = { pnl: Infinity, shock: null, volDir: null };
+  for (const sh of shocks) {
+    const cells = volDirs.map(vd => {
+      const p = pnlAt(sh, vd);
+      if (p < worst.pnl) worst = { pnl: p, shock: sh, volDir: vd };
+      return { volDir: vd, pnl: p };
+    });
+    grid.push({ shock: sh, price: S * (1 + sh), cells: cells });
+  }
+
+  const worstLossUsd = Math.min(0, worst.pnl);
+  const contFutBtc = futuresContingencyBtc(active, S, pm);
+  const contOptBtc = optionContingencyBtc(active, S, pm);
+  const contUsd = (contFutBtc + contOptBtc) * S;
+  const mmUsd = Math.abs(worstLossUsd) + contUsd;
+  return {
+    grid, shocks, worst,
+    worstLossUsd,
+    contFutBtc, contOptBtc, contUsd,
+    mmUsd, imUsd: mmUsd * pm.imFactor,
+  };
+}
+
+/* ---------- equity / liquidation ---------- */
+/** equity ที่ใช้ค้ำ margin ได้ (หลัง haircut) หน่วย USD ที่ราคา S */
+function marginEquityUsd(account, legs, S, nowMs, daysFwd) {
+  const pnl = portfolioPnlUsd(legs, S, nowMs, daysFwd, {});
+  return account.btcBalance * S * (1 - account.haircutBtc)
+       + account.usdcBalance * (1 - account.haircutUsdc)
+       + pnl;
+}
+
+/**
+ * เส้น equity(S) และ MM(S) + จุดตัด (≈ liquidation)
+ * @param marginMode 'SM' | 'PM'
+ */
+function liqCurve(legs, account, S0, nowMs, daysFwd, cfg, marginMode, lo, hi, n) {
+  n = n || 161;
+  const active = legs.filter(l => l.enabled !== false);
+  const mmAt = S => marginMode === 'PM'
+    ? pmMargin(active, S, nowMs, daysFwd, cfg).mmUsd
+    : smMargin(active, S, nowMs, daysFwd, cfg).mmUsd;
+  const eqAt = S => marginEquityUsd(account, active, S, nowMs, daysFwd);
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const S = lo + (hi - lo) * i / n;
+    pts.push({ S: S, eq: eqAt(S), mm: mmAt(S) });
+  }
+  const gap = S => eqAt(S) - mmAt(S);
+  const crossings = findRoots(gap, lo, hi, n);
+  return { pts, crossings, gapAt: gap };
+}
+
+/* ---------- export ---------- */
+const PB = {
+  YEAR_MS, DAY_MS, defaultConfig,
+  bisect, erf, ncdf, black76Usd, markBtc,
+  isOption, isInverse, tYears, legSizeBtc, optUnitValue, fwdRatioAt,
+  legPnlUsd, portfolioPnlUsd, tailFlags,
+  findRoots, curveStats, portfolioGreeks,
+  smMargin, ivShockMult, pmPriceShocks,
+  optionContingencyBtc, futuresContingencyBtc, pmMargin,
+  marginEquityUsd, liqCurve,
+};
+root.PB = PB;
+
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script>
+<script id="payoff-map">
+"use strict";
+/* =========================================================================
+   payoff-map — แปลง acc.positions ที่ normalize แล้วเป็น leg ของ pb-core
+   ล้วนๆ ไม่แตะ DOM/เน็ต (ถูกดึงไปรันใน tests/payoff-map.test.mjs)
+   ========================================================================= */
+(function (root) {
+
+const YEAR_MS = 365 * 24 * 3600 * 1000;
+const MONTHS = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
+                 JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+
+/** "25SEP26" → timestamp 08:00 UTC ของวันนั้น (Deribit หมดอายุ 08:00 UTC เสมอ) */
+function deribitExpiryTs(token) {
+  const m = /^(\d{1,2})([A-Z]{3})(\d{2})$/.exec(String(token || ""));
+  if (!m || !(m[2] in MONTHS)) return null;
+  return Date.UTC(2000 + Number(m[3]), MONTHS[m[2]], Number(m[1]), 8, 0, 0, 0);
+}
+
+/** แยกชื่อสัญญา Deribit → { base, settle, perp, expiryTs, strike, optType } */
+function parseDeribit(name) {
+  const parts = String(name || "").split("-");
+  const head = parts[0].split("_");                 // "BTC" หรือ "BTC_USDC"
+  const out = { base: head[0] || "", settle: head[1] || null,
+                perp: false, expiryTs: null, strike: null, optType: null };
+  if (parts.length < 2) return out;                 // spot เช่น BTC_USDC
+  if (parts[1] === "PERPETUAL") { out.perp = true; return out; }
+  out.expiryTs = deribitExpiryTs(parts[1]);
+  if (parts.length >= 4) {
+    const k = parseFloat(parts[2]);
+    out.strike = isFinite(k) ? k : null;
+    out.optType = parts[3] === "C" ? "call" : parts[3] === "P" ? "put" : null;
+  }
+  return out;
+}
+
+/** รับเฉพาะสัญญาที่ underlying เป็น BTC */
+function isBtcSymbol(ex, sym) {
+  const s = String(sym || "").toUpperCase();
+  if (ex === "deribit") return s.split(/[-_]/)[0] === "BTC";
+  return /^BTC/.test(s);                            // BTCUSD / BTCUSDT / BTCPERP
+}
+
+const legKeyOf = (accIdx, ex, sym) => accIdx + "|" + ex + "|" + sym;
+
+/**
+ * positionsToLegs — pure: ไม่อ่าน DOM ไม่ยิงเน็ต
+ * @param accs [{ idx, name, exchange, positions:[ {symbol,cat,dirBuy,size,entry,mark,liq,index} ] }]
+ * @param opts { now, spot, tickers:{name→ticker}, disabled:[legKey], PB }
+ * @returns { legs, excluded } — legs พร้อมใช้กับ PB.* (มี field ส่วนเกินสำหรับ UI ได้)
+ */
+function positionsToLegs(accs, opts) {
+  opts = opts || {};
+  const now = opts.now == null ? Date.now() : opts.now;
+  const spot = opts.spot;
+  const tickers = opts.tickers || {};
+  const off = new Set(opts.disabled || []);
+  const PBx = opts.PB || root.PB;
+  const legs = [], excluded = [];
+  let nextId = 1;
+
+  (accs || []).forEach((a, ai) => {
+    const ex = a.exchange;
+    const accIdx = a.idx == null ? ai : a.idx;
+    (a.positions || []).forEach(p => {
+      const skip = reason => excluded.push({
+        accName: a.name, exchange: ex, symbol: p.symbol, reason: reason,
+      });
+      if (p.cat === "spot") return skip("spot ไม่มี payoff แบบสัญญา");
+      if (!isBtcSymbol(ex, p.symbol)) return skip("underlying ไม่ใช่ BTC");
+      const qty = Math.abs(Number(p.size) || 0);
+      const entry = Number(p.entry);
+      if (!(qty > 0)) return skip("ไม่มีขนาด position");
+      if (!(entry > 0)) return skip("ไม่มีราคาเข้า");
+
+      const leg = {
+        // --- field ที่ pb-core ใช้ ---
+        id: nextId, kind: null, side: p.dirBuy ? 1 : -1, qty: qty, entryPrice: entry,
+        expiryTs: null, strike: null, optType: "call", iv: 50,
+        markOffset: 0, fwdRatio: 1, fwdT0: null, enabled: !off.has(legKeyOf(accIdx, ex, p.symbol)),
+        // --- metadata สำหรับตาราง/เส้น liq (pb-core ไม่แตะ) ---
+        legKey: legKeyOf(accIdx, ex, p.symbol), instrument: p.symbol, symbol: p.symbol,
+        accIdx: accIdx, accName: a.name, exchange: ex, cat: p.cat,
+        liq: Number(p.liq) > 0 ? Number(p.liq) : null,
+        mark: Number(p.mark) > 0 ? Number(p.mark) : null,
+      };
+
+      if (ex === "deribit") {
+        const d = parseDeribit(p.symbol);
+        const t = tickers[p.symbol] || null;
+        if (p.cat === "option") {
+          if (!(d.strike > 0) || !d.optType || !d.expiryTs) return skip("อ่านชื่อ option ไม่ออก");
+          leg.kind = d.settle ? "lin_opt" : "inv_opt";   // BTC_USDC-… settle เป็น USDC
+          leg.strike = d.strike; leg.optType = d.optType; leg.expiryTs = d.expiryTs;
+          if (t && Number(t.mark_iv) > 0) leg.iv = Number(t.mark_iv);
+          const T = Math.max(0, d.expiryTs - now) / YEAR_MS;
+          if (t && Number(t.index_price) > 0 && Number(t.underlying_price) > 0) {
+            leg.fwdRatio = Number(t.underlying_price) / Number(t.index_price);
+            leg.fwdT0 = T;
+          }
+          // markOffset: เลื่อนเส้นโมเดลให้ผ่าน mark จริง (เหมือน syncOffsets ของ position builder)
+          const mk = t && isFinite(Number(t.mark_price)) ? Number(t.mark_price) : leg.mark;
+          if (mk != null && isFinite(mk) && PBx && spot > 0) {
+            const model = PBx.optUnitValue(Object.assign({}, leg, { markOffset: 0 }), spot, T, 1);
+            if (isFinite(model)) { leg.markOffset = mk - model; leg.mark = mk; }
+          }
+        } else if (p.cat === "inverse" || p.cat === "future") {
+          leg.kind = p.cat === "inverse" ? "inv_fut" : "lin_fut";
+          leg.expiryTs = d.perp ? null : d.expiryTs;
+          // dated future: เก็บ basis ณ ตอนนี้ไว้ให้สลายเข้าหา index ตอนหมดอายุ
+          if (leg.expiryTs && t && Number(t.index_price) > 0 && Number(t.mark_price) > 0) {
+            leg.fwdRatio = Number(t.mark_price) / Number(t.index_price);
+            leg.fwdT0 = Math.max(0, leg.expiryTs - now) / YEAR_MS;
+          }
+        } else return skip("หมวด " + p.cat + " ไม่รองรับ");
+      } else if (ex === "bybit" || ex === "phemex") {
+        if (p.cat === "option") return skip("option ของ " + ex + " ยังไม่รองรับ (v1)");
+        if (p.cat === "inverse") leg.kind = "inv_fut";        // ขนาดเป็น USD
+        else if (p.cat === "future") leg.kind = "lin_fut";    // ขนาดเป็น BTC
+        else return skip("หมวด " + p.cat + " ไม่รองรับ");
+      } else return skip("exchange " + ex + " ไม่รองรับ");
+
+      nextId++;
+      legs.push(leg);
+    });
+  });
+
+  return { legs: legs, excluded: excluded };
+}
+
+root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, legKeyOf, YEAR_MS };
+
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script>
 <script>
 "use strict";
 
-const BUILD = "2026-09-05a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-17a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -884,6 +1512,7 @@ async function refreshDeribit(acc) {
       symbol: p.instrument_name, cat,
       dirBuy: p.direction === "buy", size: Math.abs(p.size),
       entry: p.average_price, mark: p.mark_price,
+      index: p.index_price || null, // เพิ่มมาเพื่อใช้เป็น spot สำรองในแผง payoff
       liq, liqEst,
       liqFills: deribitLiqAfterFills(p, cat, sums, rawOrders, extraUsd),
       upnl: p.floating_profit_loss, upnlCcy: "",
@@ -1260,6 +1889,7 @@ document.getElementById("tabbar").addEventListener("click", e => {
   store.set("deribit_monitor_tab", activeTab);
   renderAll();
   refreshTradeMarkers(); // ชุดพอร์ทที่มองเห็นเปลี่ยน → marker เปลี่ยนตาม
+  if (payoffOpen) payoffFetch(); // ชุด instrument ที่ต้องใช้ ticker เปลี่ยนตามด้วย
 });
 
 /* ================= rendering ================= */
@@ -1401,7 +2031,350 @@ function renderTf(ex) {
     `<button data-tf="${l}"${l === tfLabel ? ' class="active"' : ""}>${l}</button>`).join("");
 }
 
-function renderAll() { renderTabs(); renderLines(); renderPanels(); renderHeader(); }
+function renderAll() {
+  renderTabs(); renderLines(); renderPanels(); renderHeader();
+  if (payoffOpen) renderPayoff();   // ปิดอยู่ = ไม่คิดอะไรเลย
+}
+
+/* ================= payoff panel ================= */
+// แผง payoff ของ position ปัจจุบัน — ใช้เครื่องคิดเลขชุดเดียวกับ deribit-position-builder (pb-core)
+const PAYOFF_POLL_MS = 20000;
+const PF_W = 1180, PF_H = 430;
+const PF = { l: 80, r: 20, t: 20, b: 34 };
+
+let payoffOpen = false;
+let payoffTickers = {};        // instrument_name → ผลของ public/ticker ล่าสุด
+let payoffSpot = null;         // index price ล่าสุด (btc_usd)
+let payoffTimer = null;
+let payoffToken = 0;           // กันผลที่มาช้าหลังปิดแผง/สลับแท็บ
+let payoffDenom = "USD";
+let payoffRangePct = 35;
+const payoffOff = new Set();   // legKey ที่ผู้ใช้ติ๊กปิด
+let payoffHit = null;          // ข้อมูลสำหรับ crosshair
+
+/* ---------- ข้อมูลสด (ผ่าน pub ที่มีอยู่แล้ว — ไม่มี host ใหม่) ---------- */
+function payoffNeedTickers() {
+  const s = new Set();
+  visibleAccounts().forEach(a => {
+    if (a.exchange !== "deribit") return;
+    a.positions.forEach(p => {
+      if (!PayoffMap.isBtcSymbol("deribit", p.symbol)) return;
+      // option ต้องใช้ IV + forward · dated future ต้องใช้ basis · perp ไม่ต้อง
+      if (p.cat === "option") s.add(p.symbol);
+      else if ((p.cat === "inverse" || p.cat === "future") && !p.symbol.includes("PERPETUAL")) s.add(p.symbol);
+    });
+  });
+  return [...s];
+}
+
+function payoffSpotValue() {
+  if (payoffSpot > 0) return payoffSpot;
+  for (const a of visibleAccounts()) {
+    if (a.exchange !== "deribit") continue;
+    for (const p of a.positions) if (p.index > 0) return p.index;
+  }
+  const cur = iparse(instrument);
+  if (lastPrice > 0 && cur.cat !== "option" && PayoffMap.isBtcSymbol(cur.ex, cur.sym)) return lastPrice;
+  return null;
+}
+
+async function payoffFetch() {
+  if (!payoffOpen) return;
+  const my = ++payoffToken;
+  const st = document.getElementById("payoffStatus");
+  if (!pub) { st.textContent = "ยังไม่ได้ต่อ Deribit public — ใช้ค่าจาก position เท่าที่มี"; return; }
+  const names = payoffNeedTickers();
+  try {
+    const idx = await pub.rpc("public/get_index_price", { index_name: "btc_usd" });
+    if (my !== payoffToken) return;
+    if (idx && idx.index_price > 0) payoffSpot = idx.index_price;
+  } catch (e) { /* ใช้ spot สำรองต่อไป */ }
+  const got = await Promise.all(names.map(n =>
+    pub.rpc("public/ticker", { instrument_name: n }).then(t => [n, t]).catch(() => null)));
+  if (my !== payoffToken) return;
+  const map = {};
+  got.forEach(g => { if (g && g[1]) map[g[0]] = g[1]; });
+  payoffTickers = map;
+  const ok = Object.keys(map).length;
+  st.textContent = `spot ${payoffSpot ? fmtP(payoffSpot) : "–"} · ticker ${ok}/${names.length}`
+    + ` · อัปเดต ${new Date().toLocaleTimeString("en-GB")}`;
+  renderPayoff();
+}
+
+/* ---------- SVG helpers ---------- */
+const pfScale = (dLo, dHi, pLo, pHi) => {
+  const span = (dHi - dLo) || 1;
+  return v => pLo + (v - dLo) / span * (pHi - pLo);
+};
+function pfTicks(lo, hi, count) {
+  if (!(hi > lo)) return [lo];
+  const raw = (hi - lo) / (count || 6);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(v);
+  return out;
+}
+const pfPath = pts => pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(2) + " " + p[1].toFixed(2)).join(" ");
+const pfUsd = v => v == null || !isFinite(v) ? "–" : Math.round(v).toLocaleString("en-US");
+const pfY = v => v == null || !isFinite(v) ? "–" : (payoffDenom === "BTC" ? fmtP(v) : pfUsd(v));
+const pfUnit = () => payoffDenom === "BTC" ? " ₿" : " $";
+
+/* ---------- render ---------- */
+function renderPayoff() {
+  if (!payoffOpen) return;
+  const svg = document.getElementById("payoffSvg");
+  const sumEl = document.getElementById("payoffSummary");
+  const legsEl = document.getElementById("payoffLegs");
+  const exEl = document.getElementById("payoffExcluded");
+  const accs = visibleAccounts();
+  document.getElementById("payoffScope").textContent =
+    !accs.length ? "" : isOverview() ? `ทุกพอร์ท (${accs.length})` : accs[0].name;
+
+  const blank = msg => {
+    svg.innerHTML = `<text x="${PF_W / 2}" y="${PF_H / 2}" text-anchor="middle">${esc(msg)}</text>`;
+    sumEl.innerHTML = ""; legsEl.innerHTML = "";
+    payoffHit = null;
+  };
+  if (!accounts.length) { exEl.innerHTML = ""; return blank("ยังไม่ได้ใส่ API key — กด ⚙ ตั้งค่า"); }
+
+  const now = Date.now();
+  const spot = payoffSpotValue();
+  const m = PayoffMap.positionsToLegs(accs, {
+    now, spot, tickers: payoffTickers, disabled: [...payoffOff], PB,
+  });
+  const legs = m.legs;
+
+  exEl.innerHTML = m.excluded.length
+    ? `<div class="pf-note">ไม่ได้รวมในกราฟ: ` + m.excluded.map(x =>
+        `${esc(x.accName)} · ${esc(x.symbol)} (${esc(x.reason)})`).join(" · ") + `</div>`
+    : "";
+  legsEl.innerHTML = legs.length ? payoffLegsHtml(legs) : "";
+  if (!legs.length) { sumEl.innerHTML = ""; payoffHit = null;
+    svg.innerHTML = `<text x="${PF_W / 2}" y="${PF_H / 2}" text-anchor="middle">ไม่มี position ที่คำนวณ payoff ได้</text>`;
+    return;
+  }
+  if (!(spot > 0)) { sumEl.innerHTML = ""; payoffHit = null;
+    svg.innerHTML = `<text x="${PF_W / 2}" y="${PF_H / 2}" text-anchor="middle">ยังไม่รู้ราคา BTC — รอข้อมูลจาก Deribit</text>`;
+    return;
+  }
+
+  const active = legs.filter(l => l.enabled !== false);
+  const lo = Math.max(1, spot * (1 - payoffRangePct / 100));
+  const hi = spot * (1 + payoffRangePct / 100);
+  const toD = (usd, s) => payoffDenom === "BTC" ? usd / s : usd;
+  const fExp = s => toD(PB.portfolioPnlUsd(active, s, now, 0, { expiry: true }), s);
+  const fMdl = s => toD(PB.portfolioPnlUsd(active, s, now, 0, {}), s);
+  // ไม่มี option และไม่มี basis ค้าง → สองเส้นทับกัน แสดงเส้นเดียวพอ
+  const showModel = active.some(l =>
+    PB.isOption(l) || (l.expiryTs && l.fwdRatio && Math.abs(l.fwdRatio - 1) > 1e-9));
+
+  const stats = active.length ? PB.curveStats(fExp, lo, hi, 600) : null;
+  const greeks = active.length ? PB.portfolioGreeks(active, spot, now, 0) : null;
+  const pnlNow = active.length ? toD(PB.portfolioPnlUsd(active, spot, now, 0, {}), spot) : 0;
+
+  payoffDrawChart(svg, { active, lo, hi, spot, fExp, fMdl, showModel, stats, legs });
+  sumEl.innerHTML = payoffSummaryHtml(stats, greeks, pnlNow, active.length);
+}
+
+function payoffDrawChart(svg, C) {
+  const px0 = PF.l, px1 = PF_W - PF.r, py0 = PF.t, py1 = PF_H - PF.b;
+  if (!C.active.length) {
+    svg.innerHTML = `<text x="${PF_W / 2}" y="${PF_H / 2}" text-anchor="middle">ปิดทุกขาอยู่ — ติ๊กเปิดอย่างน้อยหนึ่งขา</text>`;
+    payoffHit = null; return;
+  }
+  const N = 420;
+  const xs = [], ye = [], ym = [];
+  for (let i = 0; i <= N; i++) {
+    const s = C.lo + (C.hi - C.lo) * i / N;
+    xs.push(s); ye.push(C.fExp(s)); ym.push(C.showModel ? C.fMdl(s) : NaN);
+  }
+  const all = ye.concat(C.showModel ? ym : []).filter(isFinite);
+  let yLo = Math.min(...all, 0), yHi = Math.max(...all, 0);
+  const pad = (yHi - yLo) * 0.08 || 1;
+  yLo -= pad; yHi += pad;
+
+  const sx = pfScale(C.lo, C.hi, px0, px1);
+  const sy = pfScale(yLo, yHi, py1, py0);
+  const zeroY = sy(0);
+  const ptsE = xs.map((s, i) => [sx(s), sy(ye[i])]);
+  const areaE = pfPath(ptsE) + ` L ${px1.toFixed(2)} ${zeroY.toFixed(2)} L ${px0.toFixed(2)} ${zeroY.toFixed(2)} Z`;
+
+  let g = `<defs>
+    <clipPath id="pf-up"><rect x="${px0}" y="${py0}" width="${px1 - px0}" height="${Math.max(0, zeroY - py0)}"/></clipPath>
+    <clipPath id="pf-dn"><rect x="${px0}" y="${zeroY}" width="${px1 - px0}" height="${Math.max(0, py1 - zeroY)}"/></clipPath>
+    <clipPath id="pf-plot"><rect x="${px0}" y="${py0}" width="${px1 - px0}" height="${py1 - py0}"/></clipPath>
+  </defs>`;
+  for (const t of pfTicks(yLo, yHi, 6)) {
+    const y = sy(t);
+    if (y < py0 - 1 || y > py1 + 1) continue;
+    g += `<line x1="${px0}" y1="${y.toFixed(1)}" x2="${px1}" y2="${y.toFixed(1)}" stroke="#2a2f3d" stroke-width="1"/>`;
+    g += `<text x="${px0 - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end">${pfY(t)}</text>`;
+  }
+  for (const t of pfTicks(C.lo, C.hi, 8)) {
+    const x = sx(t);
+    if (x < px0 - 1 || x > px1 + 1) continue;
+    g += `<line x1="${x.toFixed(1)}" y1="${py0}" x2="${x.toFixed(1)}" y2="${py1}" stroke="#2a2f3d" stroke-width="1" opacity=".7"/>`;
+    g += `<text x="${x.toFixed(1)}" y="${py1 + 18}" text-anchor="middle">${pfUsd(t)}</text>`;
+  }
+  g += `<g clip-path="url(#pf-plot)">`;
+  g += `<path d="${areaE}" fill="#26a69a" opacity=".15" clip-path="url(#pf-up)"/>`;
+  g += `<path d="${areaE}" fill="#ef5350" opacity=".15" clip-path="url(#pf-dn)"/>`;
+  g += `<line x1="${px0}" y1="${zeroY.toFixed(1)}" x2="${px1}" y2="${zeroY.toFixed(1)}" stroke="#7d8598" stroke-width="1.2" stroke-dasharray="4 4"/>`;
+  if (C.showModel) {
+    const ptsM = xs.map((s, i) => [sx(s), sy(ym[i])]).filter(p => isFinite(p[1]));
+    g += `<path d="${pfPath(ptsM)}" fill="none" stroke="#4a90d9" stroke-width="1.8" stroke-dasharray="6 4"/>`;
+  }
+  g += `<path d="${pfPath(ptsE)}" fill="none" stroke="#d5dae6" stroke-width="2.2"/>`;
+  g += `</g>`;
+
+  // spot
+  const xSpot = sx(C.spot);
+  if (xSpot >= px0 && xSpot <= px1) {
+    g += `<line x1="${xSpot.toFixed(1)}" y1="${py0}" x2="${xSpot.toFixed(1)}" y2="${py1}" stroke="#ff9f43" stroke-width="1.5" opacity=".85"/>`;
+    g += `<text x="${xSpot.toFixed(1)}" y="${py0 - 5}" text-anchor="middle" fill="#ff9f43">spot ${pfUsd(C.spot)}</text>`;
+  }
+  // breakeven
+  if (C.stats) for (const b of C.stats.breakevens) {
+    const x = sx(b);
+    if (x < px0 || x > px1) continue;
+    g += `<path d="M ${x.toFixed(1)} ${(zeroY - 6).toFixed(1)} l 6 6 l -6 6 l -6 -6 Z" fill="#e0c060"/>`;
+    g += `<text x="${x.toFixed(1)}" y="${(zeroY + 26).toFixed(1)}" text-anchor="middle" fill="#e0c060">BE ${pfUsd(b)}</text>`;
+  }
+  // จุด liquidation ของแต่ละขา (สีเดียวกับในกราฟหลัก)
+  const multi = isOverview();
+  const seen = new Set();
+  C.legs.forEach(l => {
+    if (!(l.liq > 0) || l.liq < C.lo || l.liq > C.hi) return;
+    const k = l.accIdx + "|" + l.liq.toFixed(2);
+    if (seen.has(k)) return;
+    seen.add(k);
+    const x = sx(l.liq);
+    g += `<line x1="${x.toFixed(1)}" y1="${py1 - 26}" x2="${x.toFixed(1)}" y2="${py1}" style="stroke:var(--liq)" stroke-width="1.5"/>`;
+    g += `<text x="${x.toFixed(1)}" y="${(py1 - 30).toFixed(1)}" text-anchor="middle" style="fill:var(--liq)">${
+      multi ? esc(l.accName) + " " : ""}liq ${pfUsd(l.liq)}</text>`;
+  });
+  // legend
+  g += `<g transform="translate(${px0 + 8},${py0 + 12})">
+    <line x1="0" y1="0" x2="18" y2="0" stroke="#d5dae6" stroke-width="2.2"/><text x="24" y="4" fill="#d5dae6">ณ วันหมดอายุ</text>`
+    + (C.showModel
+      ? `<line x1="118" y1="0" x2="136" y2="0" stroke="#4a90d9" stroke-width="1.8" stroke-dasharray="6 4"/><text x="142" y="4" fill="#4a90d9">T+0 ตอนนี้</text>`
+      : "") + `</g>`;
+  g += `<g id="pf-cross"></g>`;
+  svg.innerHTML = g;
+  payoffHit = { svg, sx, px0, px1, py0, py1, xs, ye, ym, showModel: C.showModel };
+}
+
+function payoffCrosshair(ev) {
+  if (!payoffHit) return;
+  const h = payoffHit;
+  const g = h.svg.querySelector("#pf-cross");
+  if (!g) return;
+  const r = h.svg.getBoundingClientRect();
+  if (!r.width) return;
+  const x = (ev.clientX - r.left) / r.width * PF_W;
+  if (x < h.px0 || x > h.px1) { g.innerHTML = ""; return; }
+  const idx = Math.round((x - h.px0) / (h.px1 - h.px0) * (h.xs.length - 1));
+  const s = h.xs[idx], cx = h.sx(s);
+  const boxW = 190, boxH = h.showModel ? 62 : 46;
+  const bx = cx + 12 + boxW > h.px1 ? cx - 12 - boxW : cx + 12;
+  g.innerHTML =
+    `<line x1="${cx.toFixed(1)}" y1="${h.py0}" x2="${cx.toFixed(1)}" y2="${h.py1}" stroke="#7d8598" stroke-width="1" stroke-dasharray="3 3"/>` +
+    `<rect x="${bx.toFixed(1)}" y="${h.py0 + 6}" width="${boxW}" height="${boxH}" rx="5" fill="#1a1e28" stroke="#2a2f3d"/>` +
+    `<text x="${(bx + 10).toFixed(1)}" y="${h.py0 + 24}" fill="#d5dae6">BTC ${pfUsd(s)}</text>` +
+    `<text x="${(bx + 10).toFixed(1)}" y="${h.py0 + 42}" fill="#d5dae6">หมดอายุ ${pfY(h.ye[idx])}${pfUnit()}</text>` +
+    (h.showModel
+      ? `<text x="${(bx + 10).toFixed(1)}" y="${h.py0 + 58}" fill="#4a90d9">T+0 ${pfY(h.ym[idx])}${pfUnit()}</text>`
+      : "");
+}
+
+function payoffSummaryHtml(stats, greeks, pnlNow, nActive) {
+  if (!stats) return "";
+  const u = pfUnit();
+  const cls = v => v >= 0 ? "pnl-pos" : "pnl-neg";
+  const be = stats.breakevens.length
+    ? stats.breakevens.map(pfUsd).join(" · ") : "ไม่มีในช่วงนี้";
+  return `<div class="pf-sum">
+    <span><span class="lbl">PnL ตอนนี้</span> <span class="${cls(pnlNow)}">${pfY(pnlNow)}${u}</span></span>
+    <span><span class="lbl">กำไรสูงสุด</span> ${stats.unboundedUp
+      ? '<span class="pnl-pos">ไม่จำกัด</span>' : `<span class="pnl-pos">${pfY(stats.maxProfit)}${u}</span>`}</span>
+    <span><span class="lbl">ขาดทุนสูงสุด</span> ${stats.unboundedDown
+      ? '<span class="pnl-neg">ไม่จำกัด</span>' : `<span class="pnl-neg">${pfY(stats.maxLoss)}${u}</span>`}</span>
+    <span><span class="lbl">breakeven</span> ${be}</span>
+    <span title="BTC ที่ได้/เสียต่อราคาที่ขยับ 1 ดอลลาร์ × 1"><span class="lbl">delta</span> ${fmtP(greeks.delta)} ₿</span>
+    <span title="delta เปลี่ยนไปเท่าไรเมื่อราคาขยับ 1%"><span class="lbl">gamma/1%</span> ${fmtP(greeks.gammaPer1Pct)}</span>
+    <span title="USD ต่อ IV 1 จุด"><span class="lbl">vega</span> ${pfUsd(greeks.vega)}</span>
+    <span title="USD ต่อ 1 วัน"><span class="lbl">theta</span> ${pfUsd(greeks.theta)}</span>
+    <span><span class="lbl">ขาที่เปิด</span> ${nActive}</span>
+  </div>`;
+}
+
+function payoffLegsHtml(legs) {
+  const opt = legs.some(l => PB.isOption(l));
+  return `<table class="pf-legs">
+    <tr><th></th><th>พอร์ท</th><th>Ex</th><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th>
+        ${opt ? "<th>IV</th><th>Mark</th>" : ""}<th>Liq</th></tr>
+    ${legs.map(l => `<tr>
+      <td><input type="checkbox" class="pf-leg" data-k="${esc(l.legKey)}"${l.enabled ? " checked" : ""}></td>
+      <td>${esc(l.accName)}</td>
+      <td><span class="ex-tag">${esc(l.exchange)}</span></td>
+      <td>${esc(l.symbol)}</td>
+      <td class="${l.side > 0 ? "long" : "short"}">${l.side > 0 ? "LONG" : "SHORT"}</td>
+      <td>${fmt(l.qty)}</td>
+      <td>${fmtP(l.entryPrice)}</td>
+      ${opt ? `<td>${PB.isOption(l) ? fmtP(l.iv) + "%" : "–"}</td>
+               <td>${PB.isOption(l) && l.mark != null ? fmtP(l.mark) : "–"}</td>` : ""}
+      <td class="liq-val">${l.liq ? fmtP(l.liq) : "–"}</td>
+    </tr>`).join("")}
+  </table>`;
+}
+
+/* ---------- payoff: events ---------- */
+document.getElementById("btnPayoff").onclick = () => {
+  payoffOpen = true;
+  document.getElementById("payoffModal").classList.add("show");
+  renderPayoff();
+  payoffFetch();
+  clearInterval(payoffTimer);
+  payoffTimer = setInterval(payoffFetch, PAYOFF_POLL_MS);
+};
+function closePayoff() {
+  payoffOpen = false;
+  payoffToken++;                       // ทิ้งผลที่ยังค้างอยู่
+  clearInterval(payoffTimer); payoffTimer = null;
+  payoffHit = null;
+  document.getElementById("payoffModal").classList.remove("show");
+}
+document.getElementById("btnPayoffClose").onclick = closePayoff;
+document.getElementById("payoffModal").addEventListener("click", e => {
+  if (e.target.id === "payoffModal") closePayoff();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape" && payoffOpen) closePayoff(); });
+document.getElementById("payoffDenom").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  payoffDenom = b.dataset.denom;
+  [...e.currentTarget.querySelectorAll("button")].forEach(x =>
+    x.classList.toggle("active", x === b));
+  renderPayoff();
+});
+document.getElementById("payoffRange").addEventListener("input", e => {
+  payoffRangePct = +e.target.value;
+  document.getElementById("payoffRangeVal").textContent = "±" + payoffRangePct + "%";
+  renderPayoff();
+});
+document.getElementById("payoffLegs").addEventListener("change", e => {
+  const cb = e.target.closest(".pf-leg");
+  if (!cb) return;
+  if (cb.checked) payoffOff.delete(cb.dataset.k); else payoffOff.add(cb.dataset.k);
+  renderPayoff();
+});
+document.getElementById("payoffSvg").addEventListener("mousemove", payoffCrosshair);
+document.getElementById("payoffSvg").addEventListener("mouseleave", () => {
+  const g = payoffHit && payoffHit.svg.querySelector("#pf-cross");
+  if (g) g.innerHTML = "";
+});
 
 /* ================= UI events ================= */
 document.getElementById("tfGroup").addEventListener("click", e => {
