@@ -152,6 +152,30 @@
   .pf-note { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.6; }
   .pf-legs td, .pf-legs th { padding: 3px 12px 3px 0; }
   .pf-legs input[type=checkbox] { cursor: pointer; }
+  /* ---- ขา what-if (ขาสมมติ) ---- */
+  .pf-legs tr.pf-wi td { border-top: 1px dashed var(--blue); font-style: italic; }
+  .pf-wi-tag {
+    font-size: 10px; font-weight: 700; letter-spacing: .6px; font-style: normal;
+    color: var(--blue); border: 1px dashed var(--blue); border-radius: 4px; padding: 1px 5px;
+  }
+  .pf-legs .wi-num {
+    width: 92px; background: #232836; border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); padding: 2px 5px; font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .pf-legs .wi-num.bad { border-color: var(--red); }
+  .pf-legs .wi-side { padding: 1px 7px; font-size: 11px; font-weight: 600; }
+  .pf-wi-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+               margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  #wiForm { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  #wiForm.hide { display: none; }
+  #wiForm.fut .wi-opt { display: none; }
+  #wiForm .wi-opt { display: inline-flex; gap: 5px; align-items: center; }
+  #wiForm select, #wiForm input {
+    background: #232836; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--text); padding: 4px 7px; font-size: 12.5px;
+  }
+  #wiForm #wiQty { width: 100px; font-variant-numeric: tabular-nums; }
+  #wiStatus.err { color: var(--red); }
 </style>
 </head>
 <body>
@@ -219,6 +243,29 @@
     <svg id="payoffSvg" viewBox="0 0 1180 430"></svg>
     <div id="payoffSummary"></div>
     <div id="payoffLegs"></div>
+    <div class="pf-wi-bar">
+      <button id="btnWiToggle">➕ เพิ่มขา what-if</button>
+      <button id="btnWiClear">ล้างขา what-if ทั้งหมด</button>
+      <span id="wiStatus" class="lbl"></span>
+    </div>
+    <div id="wiForm" class="hide">
+      <select id="wiKind">
+        <option value="inv_opt">Option (BTC)</option>
+        <option value="inv_fut">Future/Perp (BTC-PERPETUAL)</option>
+      </select>
+      <span class="wi-opt"><label class="lbl" for="wiExpiry">หมดอายุ</label><select id="wiExpiry"></select></span>
+      <span class="wi-opt"><label class="lbl" for="wiStrike">strike</label><select id="wiStrike"></select></span>
+      <div class="tf-group wi-opt" id="wiType">
+        <button data-t="call" class="active">Call</button><button data-t="put">Put</button>
+      </div>
+      <div class="tf-group" id="wiSide">
+        <button data-s="1" class="active">Long</button><button data-s="-1">Short</button>
+      </div>
+      <label class="lbl" for="wiQty">จำนวน</label>
+      <input type="number" id="wiQty" value="0.1" step="0.1" min="0.1">
+      <span id="wiQtyHint" class="lbl"></span>
+      <button id="btnWiAdd" class="btn-primary">เพิ่ม</button>
+    </div>
     <div id="payoffExcluded"></div>
   </div>
 </div>
@@ -802,14 +849,134 @@ function positionsToLegs(accs, opts) {
   return { legs: legs, excluded: excluded };
 }
 
-root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, legKeyOf, YEAR_MS };
+/* =========================================================================
+   what-if — ขาสมมติที่ผู้ใช้เพิ่มเองในแผง payoff (เก็บใน localStorage)
+   ข้อมูลที่อ่านกลับมาถือว่า "ไม่น่าเชื่อถือ" ต้องผ่าน sanitizeWhatIf ก่อนเสมอ
+   ========================================================================= */
+const WI_INST_RE = /^[A-Z0-9][A-Z0-9_.-]{0,63}$/;
+const WI_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** legKey ของขา what-if — ขึ้นต้นด้วย "whatif" จึงไม่ชนกับ accIdx|exchange|symbol ของขาจริง */
+const whatIfKeyOf = id => "whatif|" + id;
+
+/** ตรวจ/ปรับ entry เดียว — คืน null ถ้าใช้ไม่ได้ (เสีย, หมดอายุ, id ซ้ำ) */
+function cleanWhatIf(raw, now, seen) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const kind = raw.kind === "inv_opt" ? "inv_opt" : raw.kind === "inv_fut" ? "inv_fut" : null;
+  if (!kind) return null;
+  const id = typeof raw.id === "string" && WI_ID_RE.test(raw.id) ? raw.id : null;
+  if (!id || (seen && seen.has(id))) return null;
+  const inst = typeof raw.instrument === "string" && WI_INST_RE.test(raw.instrument.toUpperCase())
+    ? raw.instrument.toUpperCase() : null;
+  if (!inst) return null;
+  const sideN = Number(raw.side);
+  const side = sideN > 0 ? 1 : sideN < 0 ? -1 : null;
+  if (!side) return null;
+  const qty = Number(raw.qty), entry = Number(raw.entryPrice);
+  if (!(qty > 0) || !isFinite(qty) || !(entry > 0) || !isFinite(entry)) return null;
+
+  const it = { id: id, kind: kind, instrument: inst, side: side, qty: qty, entryPrice: entry,
+               strike: null, optType: null, expiryTs: null, iv: 50, mark: null,
+               fwdRatio: 1, fwdT0: null };
+  const ts = Number(raw.expiryTs);
+  if (kind === "inv_opt") {
+    const k = Number(raw.strike);
+    const ot = raw.optType === "call" ? "call" : raw.optType === "put" ? "put" : null;
+    if (!(k > 0) || !isFinite(k) || !ot) return null;
+    if (!isFinite(ts) || !(ts > now)) return null;          // หมดอายุแล้ว/ไม่มีวันหมดอายุ = ทิ้ง
+    it.strike = k; it.optType = ot; it.expiryTs = ts;
+    const iv = Number(raw.iv);
+    if (iv > 0 && iv < 1000) it.iv = iv;
+    const mk = Number(raw.mark);                            // null → 0 ได้ จึงต้องเช็ค > 0
+    if (mk > 0 && isFinite(mk)) it.mark = mk;
+    const fr = Number(raw.fwdRatio);
+    if (fr > 0 && fr < 10) it.fwdRatio = fr;
+    const t0 = Number(raw.fwdT0);
+    if (t0 > 0 && isFinite(t0)) it.fwdT0 = t0;
+  } else if (isFinite(ts) && ts > 0) {                      // dated future (perp = ไม่มี expiryTs)
+    if (!(ts > now)) return null;
+    it.expiryTs = ts;
+  }
+  return it;
+}
+
+/**
+ * sanitizeWhatIf — กรองรายการที่อ่านมาจาก localStorage ให้เหลือเฉพาะ entry ที่ปลอดภัย
+ * @returns { items, dropped }
+ */
+function sanitizeWhatIf(list, opts) {
+  opts = opts || {};
+  const now = opts.now == null ? Date.now() : opts.now;
+  const items = [], seen = new Set();
+  let dropped = 0;
+  const src = Array.isArray(list) ? list : [];
+  for (const raw of src) {
+    const it = cleanWhatIf(raw, now, seen);
+    if (it) { seen.add(it.id); items.push(it); } else dropped++;
+  }
+  return { items: items, dropped: dropped };
+}
+
+/**
+ * whatIfToLegs — pure: ไม่อ่าน DOM ไม่ยิงเน็ต
+ * entryPrice มาจากค่าที่เก็บไว้เสมอ (ผู้ใช้กำหนดตอนเพิ่ม/แก้) — ticker ที่ poll มาอัปเดตแค่ IV/forward/mark
+ * @param opts { now, spot, tickers, disabled:[legKey], PB, idStart }
+ * @returns { legs, dropped }
+ */
+function whatIfToLegs(list, opts) {
+  opts = opts || {};
+  const now = opts.now == null ? Date.now() : opts.now;
+  const spot = opts.spot;
+  const tickers = opts.tickers || {};
+  const off = new Set(opts.disabled || []);
+  const PBx = opts.PB || root.PB;
+  const s = sanitizeWhatIf(list, { now: now });
+  let nextId = opts.idStart == null ? 1 : opts.idStart;
+
+  const legs = s.items.map(it => {
+    const t = tickers[it.instrument] || null;
+    const leg = {
+      // --- field ที่ pb-core ใช้ ---
+      id: nextId++, kind: it.kind, side: it.side, qty: it.qty, entryPrice: it.entryPrice,
+      expiryTs: it.expiryTs, strike: it.strike, optType: it.optType || "call", iv: it.iv,
+      markOffset: 0, fwdRatio: it.fwdRatio, fwdT0: it.fwdT0,
+      enabled: !off.has(whatIfKeyOf(it.id)),
+      // --- metadata สำหรับตาราง (pb-core ไม่แตะ) ---
+      legKey: whatIfKeyOf(it.id), whatIf: true, wiId: it.id,
+      instrument: it.instrument, symbol: it.instrument,
+      accIdx: null, accName: "what-if", exchange: "deribit",
+      cat: it.kind === "inv_opt" ? "option" : "inverse",
+      liq: null, mark: it.mark,
+    };
+    if (it.kind === "inv_opt") {
+      const T = Math.max(0, it.expiryTs - now) / YEAR_MS;
+      if (t && Number(t.mark_iv) > 0) leg.iv = Number(t.mark_iv);
+      if (t && Number(t.index_price) > 0 && Number(t.underlying_price) > 0) {
+        leg.fwdRatio = Number(t.underlying_price) / Number(t.index_price);
+        leg.fwdT0 = T;
+      }
+      // markOffset: คาลิเบรตแบบเดียวกับขา option จริงใน positionsToLegs
+      // (ที่นี่บังคับ mark > 0 เพราะ mark ที่เก็บไว้/ที่ ticker ส่งมาเป็น null จะกลายเป็น 0 แล้วเพี้ยน)
+      const mk = t && Number(t.mark_price) > 0 ? Number(t.mark_price) : leg.mark;
+      if (mk > 0 && isFinite(mk) && PBx && spot > 0) {
+        const model = PBx.optUnitValue(Object.assign({}, leg, { markOffset: 0 }), spot, T, 1);
+        if (isFinite(model)) { leg.markOffset = mk - model; leg.mark = mk; }
+      }
+    }
+    return leg;
+  });
+  return { legs: legs, dropped: s.dropped };
+}
+
+root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, legKeyOf,
+                   sanitizeWhatIf, whatIfToLegs, whatIfKeyOf, YEAR_MS };
 
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 </script>
 <script>
 "use strict";
 
-const BUILD = "2026-09-17a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-17b"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -2052,6 +2219,13 @@ let payoffRangePct = 35;
 const payoffOff = new Set();   // legKey ที่ผู้ใช้ติ๊กปิด
 let payoffHit = null;          // ข้อมูลสำหรับ crosshair
 
+const WI_KEY = "deribit_monitor_whatif";
+let whatIfList = [];           // ขาสมมติ (global ทุกแท็บ) — sanitize แล้วเสมอ
+let wiChain = null;            // instrument ของ Deribit ที่โหลดแล้ว (แคชในหน่วยความจำ)
+let wiChainPromise = null;
+let wiSide = 1, wiType = "call";
+let wiSeq = 0;
+
 /* ---------- ข้อมูลสด (ผ่าน pub ที่มีอยู่แล้ว — ไม่มี host ใหม่) ---------- */
 function payoffNeedTickers() {
   const s = new Set();
@@ -2063,6 +2237,10 @@ function payoffNeedTickers() {
       if (p.cat === "option") s.add(p.symbol);
       else if ((p.cat === "inverse" || p.cat === "future") && !p.symbol.includes("PERPETUAL")) s.add(p.symbol);
     });
+  });
+  // ขา what-if ก็ต้องการ ticker สด (IV/forward/mark) — entryPrice ไม่ถูกทับ เพราะมาจากค่าที่เก็บไว้
+  whatIfList.forEach(it => {
+    if (it.kind === "inv_opt" || !it.instrument.includes("PERPETUAL")) s.add(it.instrument);
   });
   return [...s];
 }
@@ -2137,14 +2315,23 @@ function renderPayoff() {
     sumEl.innerHTML = ""; legsEl.innerHTML = "";
     payoffHit = null;
   };
-  if (!accounts.length) { exEl.innerHTML = ""; return blank("ยังไม่ได้ใส่ API key — กด ⚙ ตั้งค่า"); }
-
   const now = Date.now();
   const spot = payoffSpotValue();
+  const disabled = [...payoffOff];
   const m = PayoffMap.positionsToLegs(accs, {
-    now, spot, tickers: payoffTickers, disabled: [...payoffOff], PB,
+    now, spot, tickers: payoffTickers, disabled, PB,
   });
-  const legs = m.legs;
+  // ขา what-if ต่อท้ายขาจริง — id ไม่ซ้ำ, legKey คนละ namespace
+  const wi = PayoffMap.whatIfToLegs(whatIfList, {
+    now, spot, tickers: payoffTickers, disabled, PB, idStart: m.legs.length + 1,
+  });
+  if (wi.dropped) {                      // หมดอายุระหว่างเปิดแผงอยู่ — เก็บกวาดแล้วเขียนทับ
+    whatIfList = PayoffMap.sanitizeWhatIf(whatIfList, { now }).items;
+    wiSave();
+  }
+  const legs = m.legs.concat(wi.legs);
+  wiSyncBar();
+  if (!accounts.length && !legs.length) { exEl.innerHTML = ""; return blank("ยังไม่ได้ใส่ API key — กด ⚙ ตั้งค่า"); }
 
   exEl.innerHTML = m.excluded.length
     ? `<div class="pf-note">ไม่ได้รวมในกราฟ: ` + m.excluded.map(x =>
@@ -2175,7 +2362,17 @@ function renderPayoff() {
   const pnlNow = active.length ? toD(PB.portfolioPnlUsd(active, spot, now, 0, {}), spot) : 0;
 
   payoffDrawChart(svg, { active, lo, hi, spot, fExp, fMdl, showModel, stats, legs });
-  sumEl.innerHTML = payoffSummaryHtml(stats, greeks, pnlNow, active.length);
+  sumEl.innerHTML = payoffSummaryHtml(stats, greeks, pnlNow, active.length, wiPremium(active, spot));
+}
+
+/** premium สุทธิของขา what-if ที่เป็น option: + = จ่ายออก, − = รับเข้า (BTC) */
+function wiPremium(active, spot) {
+  let btc = 0, n = 0;
+  for (const l of active) {
+    if (!l.whatIf || l.kind !== "inv_opt") continue;
+    btc += l.side * l.qty * l.entryPrice; n++;
+  }
+  return n ? { btc, usd: spot > 0 ? btc * spot : null } : null;
 }
 
 function payoffDrawChart(svg, C) {
@@ -2289,12 +2486,15 @@ function payoffCrosshair(ev) {
       : "");
 }
 
-function payoffSummaryHtml(stats, greeks, pnlNow, nActive) {
+function payoffSummaryHtml(stats, greeks, pnlNow, nActive, prem) {
   if (!stats) return "";
   const u = pfUnit();
   const cls = v => v >= 0 ? "pnl-pos" : "pnl-neg";
   const be = stats.breakevens.length
     ? stats.breakevens.map(pfUsd).join(" · ") : "ไม่มีในช่วงนี้";
+  const premHtml = !prem ? "" : `<span title="ผลรวม side × จำนวน × ราคาเข้า ของขา what-if ที่เป็น option">
+      <span class="lbl">premium what-if</span> ${prem.btc >= 0 ? "จ่าย" : "รับ"}
+      ${fmtP(Math.abs(prem.btc))} ₿${prem.usd == null ? "" : " (" + pfUsd(Math.abs(prem.usd)) + " $)"}</span>`;
   return `<div class="pf-sum">
     <span><span class="lbl">PnL ตอนนี้</span> <span class="${cls(pnlNow)}">${pfY(pnlNow)}${u}</span></span>
     <span><span class="lbl">กำไรสูงสุด</span> ${stats.unboundedUp
@@ -2307,15 +2507,17 @@ function payoffSummaryHtml(stats, greeks, pnlNow, nActive) {
     <span title="USD ต่อ IV 1 จุด"><span class="lbl">vega</span> ${pfUsd(greeks.vega)}</span>
     <span title="USD ต่อ 1 วัน"><span class="lbl">theta</span> ${pfUsd(greeks.theta)}</span>
     <span><span class="lbl">ขาที่เปิด</span> ${nActive}</span>
+    ${premHtml}
   </div>`;
 }
 
 function payoffLegsHtml(legs) {
   const opt = legs.some(l => PB.isOption(l));
+  const wi = legs.some(l => l.whatIf);
   return `<table class="pf-legs">
     <tr><th></th><th>พอร์ท</th><th>Ex</th><th>Instrument</th><th>Side</th><th>Size</th><th>Entry</th>
-        ${opt ? "<th>IV</th><th>Mark</th>" : ""}<th>Liq</th></tr>
-    ${legs.map(l => `<tr>
+        ${opt ? "<th>IV</th><th>Mark</th>" : ""}<th>Liq</th>${wi ? "<th></th>" : ""}</tr>
+    ${legs.map(l => l.whatIf ? wiLegRowHtml(l, opt) : `<tr>
       <td><input type="checkbox" class="pf-leg" data-k="${esc(l.legKey)}"${l.enabled ? " checked" : ""}></td>
       <td>${esc(l.accName)}</td>
       <td><span class="ex-tag">${esc(l.exchange)}</span></td>
@@ -2326,9 +2528,227 @@ function payoffLegsHtml(legs) {
       ${opt ? `<td>${PB.isOption(l) ? fmtP(l.iv) + "%" : "–"}</td>
                <td>${PB.isOption(l) && l.mark != null ? fmtP(l.mark) : "–"}</td>` : ""}
       <td class="liq-val">${l.liq ? fmtP(l.liq) : "–"}</td>
+      ${wi ? "<td></td>" : ""}
     </tr>`).join("")}
   </table>`;
 }
+
+/* ตัวเลขทุกตัวที่ยัดลง value มาจาก sanitizeWhatIf แล้ว (เป็น number แน่นอน) — string ผ่าน esc */
+function wiLegRowHtml(l, opt) {
+  const id = esc(l.wiId);
+  const isOpt = l.kind === "inv_opt";
+  return `<tr class="pf-wi">
+    <td><input type="checkbox" class="pf-leg" data-k="${esc(l.legKey)}"${l.enabled ? " checked" : ""}></td>
+    <td><span class="pf-wi-tag">what-if</span></td>
+    <td><span class="ex-tag">${esc(l.exchange)}</span></td>
+    <td>${esc(l.symbol)}</td>
+    <td><button class="wi-side ${l.side > 0 ? "long" : "short"}" data-id="${id}"
+        title="สลับ Long/Short">${l.side > 0 ? "LONG" : "SHORT"}</button></td>
+    <td><input type="number" class="wi-num wi-qty" data-id="${id}" value="${l.qty}"
+        min="0" step="${isOpt ? 0.1 : 10}" title="${isOpt ? "สัญญา (BTC)" : "USD"}"></td>
+    <td><input type="number" class="wi-num wi-entry" data-id="${id}" value="${l.entryPrice}"
+        min="0" step="${isOpt ? 0.0001 : 1}" title="${isOpt ? "BTC ต่อสัญญา" : "USD"}"></td>
+    ${opt ? `<td>${isOpt ? fmtP(l.iv) + "%" : "–"}</td>
+             <td>${isOpt && l.mark != null ? fmtP(l.mark) : "–"}</td>` : ""}
+    <td>–</td>
+    <td><button class="wi-del btn-x" data-id="${id}" title="ลบขา what-if นี้">✕</button></td>
+  </tr>`;
+}
+
+/* ---------- what-if: เก็บ/โหลด ---------- */
+function wiLoad() {
+  let raw = null;
+  try { raw = JSON.parse(store.get(WI_KEY) || "null"); } catch { raw = null; }
+  const r = PayoffMap.sanitizeWhatIf(raw, { now: Date.now() });
+  whatIfList = r.items;
+  if (r.dropped) wiSave();       // มีของเสีย/หมดอายุ — เขียนทับด้วยรายการที่สะอาด
+}
+function wiSave() { store.set(WI_KEY, JSON.stringify(whatIfList)); }
+const wiNewId = () => "w" + Date.now().toString(36) + (wiSeq++).toString(36);
+const wiById = id => whatIfList.find(x => x.id === id) || null;
+
+/* ---------- what-if: ฟอร์มเพิ่มขา ---------- */
+const wiEl = id => document.getElementById(id);
+function wiStatus(msg, bad) {
+  const el = wiEl("wiStatus");
+  el.textContent = msg || "";
+  el.className = bad ? "lbl err" : "lbl";
+}
+function wiSyncBar() {
+  wiEl("btnWiClear").disabled = !whatIfList.length;
+}
+
+/** รายชื่อสัญญา — ดึงครั้งแรกที่เปิดฟอร์มเท่านั้น แล้วแคชไว้ในหน่วยความจำ */
+function wiEnsureChain() {
+  if (wiChain) return Promise.resolve(wiChain);
+  if (wiChainPromise) return wiChainPromise;
+  if (!pub) return Promise.reject(new Error("ยังไม่ได้ต่อ Deribit public"));
+  const now = Date.now();
+  wiChainPromise = Promise.all([
+    pub.rpc("public/get_instruments", { currency: "BTC", kind: "option" }),
+    pub.rpc("public/get_instruments", { currency: "BTC", kind: "future" }),
+  ]).then(([opts, futs]) => {
+    wiChain = {
+      // BTC-… = settle เป็น BTC (inverse) · BTC_USDC-… ไม่เอา
+      opt: (opts || []).filter(i => i && typeof i.instrument_name === "string"
+        && /^BTC-/.test(i.instrument_name) && Number(i.strike) > 0
+        && (i.option_type === "call" || i.option_type === "put")
+        && Number(i.expiration_timestamp) > now),
+      perp: (futs || []).find(i => i && i.instrument_name === "BTC-PERPETUAL") || null,
+    };
+    return wiChain;
+  });
+  wiChainPromise.catch(() => {}).then(() => { wiChainPromise = null; });
+  return wiChainPromise;
+}
+
+const wiKind = () => wiEl("wiKind").value === "inv_fut" ? "inv_fut" : "inv_opt";
+/** instrument object ที่เลือกอยู่ (จาก get_instruments) — null ถ้ายังไม่ได้โหลด/ไม่เจอ */
+function wiSelected() {
+  if (!wiChain) return null;
+  if (wiKind() === "inv_fut") return wiChain.perp;
+  const name = wiEl("wiStrike").value;
+  return wiChain.opt.find(i => i.instrument_name === name) || null;
+}
+
+function wiRebuildExpiry() {
+  const sel = wiEl("wiExpiry");
+  if (!wiChain) { sel.innerHTML = '<option value="">—</option>'; return; }
+  const now = Date.now();
+  const exps = [...new Set(wiChain.opt.map(i => Number(i.expiration_timestamp)))].sort((a, b) => a - b);
+  const prev = sel.value;
+  sel.innerHTML = exps.map(ts => {
+    const inst = wiChain.opt.find(i => Number(i.expiration_timestamp) === ts);
+    const nm = inst.instrument_name.split("-")[1] || "";
+    return `<option value="${ts}">${esc(nm)} (${((ts - now) / 86400000).toFixed(1)} วัน)</option>`;
+  }).join("");
+  if (prev && exps.some(ts => String(ts) === prev)) sel.value = prev;
+  wiRebuildStrike();
+}
+
+function wiRebuildStrike() {
+  const sel = wiEl("wiStrike");
+  const ts = Number(wiEl("wiExpiry").value);
+  if (!wiChain || !(ts > 0)) { sel.innerHTML = '<option value="">—</option>'; return; }
+  const list = wiChain.opt
+    .filter(i => Number(i.expiration_timestamp) === ts && i.option_type === wiType)
+    .sort((a, b) => Number(a.strike) - Number(b.strike));
+  sel.innerHTML = list.map(i =>
+    `<option value="${esc(i.instrument_name)}">${pfUsd(Number(i.strike))}</option>`).join("");
+  const spot = payoffSpotValue();
+  if (list.length && spot > 0) {                 // preselect strike ที่ใกล้ spot ที่สุด
+    let best = 0, bd = Infinity;
+    list.forEach((i, n) => { const d = Math.abs(Number(i.strike) - spot); if (d < bd) { bd = d; best = n; } });
+    sel.selectedIndex = best;
+  }
+  wiSyncQty();
+}
+
+/** min/step ของช่องจำนวน มาจาก min_trade_amount ของ Deribit ไม่ใช่ค่าที่เดาเอง */
+function wiSyncQty() {
+  const isOpt = wiKind() === "inv_opt";
+  const inst = wiSelected();
+  const q = wiEl("wiQty");
+  const mta = inst && Number(inst.min_trade_amount) > 0 ? Number(inst.min_trade_amount) : null;
+  const step = mta != null ? mta : (isOpt ? 0.1 : 10);
+  q.step = step; q.min = step;
+  if (!(Number(q.value) >= step)) q.value = isOpt ? Math.max(step, 0.1) : Math.max(step, 10);
+  const cs = inst && Number(inst.contract_size) > 0 ? Number(inst.contract_size) : null;
+  wiEl("wiQtyHint").textContent = (isOpt ? "สัญญา (BTC)" : "USD")
+    + (mta != null ? " · ขั้นต่ำ " + fmt(mta) : "")
+    + (cs != null ? " · contract size " + fmt(cs) : "")
+    + (inst ? "" : " · ยังไม่ได้โหลดรายการสัญญา");
+}
+
+function wiSyncForm() {
+  wiEl("wiForm").classList.toggle("fut", wiKind() === "inv_fut");
+  if (wiKind() === "inv_opt") wiRebuildStrike(); else wiSyncQty();
+}
+
+async function wiAdd() {
+  const kind = wiKind();
+  const inst = wiSelected();
+  const name = inst && inst.instrument_name;
+  if (!name) { wiStatus("ยังไม่ได้เลือกสัญญา (รอโหลดรายการให้เสร็จก่อน)", true); return; }
+  const qty = Number(wiEl("wiQty").value);
+  if (!(qty > 0) || !isFinite(qty)) { wiStatus("จำนวนต้องเป็นตัวเลขมากกว่า 0", true); return; }
+  const btn = wiEl("btnWiAdd");
+  btn.disabled = true;
+  wiStatus("กำลังดึงราคา " + name + "…");
+  try {
+    if (!pub) throw new Error("ยังไม่ได้ต่อ Deribit public");
+    const t = await pub.rpc("public/ticker", { instrument_name: name });
+    const mk = Number(t && t.mark_price);
+    if (!(mk > 0) || !isFinite(mk)) throw new Error("ticker ไม่มี mark price");
+    if (Number(t.index_price) > 0) payoffSpot = Number(t.index_price);
+    const it = { id: wiNewId(), kind, instrument: name, side: wiSide, qty, entryPrice: mk };
+    if (kind === "inv_opt") {
+      it.strike = Number(inst.strike);
+      it.optType = inst.option_type === "put" ? "put" : "call";
+      it.expiryTs = Number(inst.expiration_timestamp);   // ใช้ค่าจาก API ไม่ใช่แกะจากชื่อ
+      it.iv = Number(t.mark_iv) > 0 ? Number(t.mark_iv) : 50;
+      it.mark = mk;
+      const fwd = Number(t.underlying_price), idx = Number(t.index_price);
+      if (fwd > 0 && idx > 0) {
+        it.fwdRatio = fwd / idx;
+        it.fwdT0 = Math.max(0, it.expiryTs - Date.now()) / PayoffMap.YEAR_MS;
+      }
+    }
+    const chk = PayoffMap.sanitizeWhatIf([it], { now: Date.now() });
+    if (!chk.items.length) throw new Error("ข้อมูลสัญญาไม่ครบ");
+    whatIfList.push(chk.items[0]);
+    wiSave();
+    payoffTickers[name] = t;                   // ใช้ได้ทันทีไม่ต้องรอ poll รอบหน้า
+    wiStatus(`เพิ่ม ${name} · ${wiSide > 0 ? "LONG" : "SHORT"} ${fmt(qty)} · entry ${fmtP(mk)}`
+      + (kind === "inv_opt" ? ` · IV ${fmtP(chk.items[0].iv)}%` : ""));
+    renderPayoff();
+  } catch (e) {
+    wiStatus("เพิ่มไม่สำเร็จ: " + (e && e.message ? e.message : String(e)), true);
+  }
+  btn.disabled = false;
+}
+
+/* ---------- what-if: events ---------- */
+wiEl("btnWiToggle").onclick = async () => {
+  const f = wiEl("wiForm");
+  f.classList.toggle("hide");
+  if (f.classList.contains("hide")) return;
+  wiSyncForm();
+  if (wiChain) return;
+  wiStatus("กำลังโหลดรายการสัญญา…");
+  try {
+    await wiEnsureChain();
+    wiRebuildExpiry(); wiSyncForm();
+    wiStatus(`พบ option ${wiChain.opt.length} สัญญา`);
+  } catch (e) { wiStatus("โหลดรายการไม่สำเร็จ: " + (e && e.message ? e.message : String(e)), true); }
+};
+wiEl("btnWiClear").onclick = () => {
+  if (!whatIfList.length) return;
+  whatIfList.forEach(it => payoffOff.delete(PayoffMap.whatIfKeyOf(it.id)));
+  whatIfList = [];
+  wiSave();
+  wiStatus("ล้างขา what-if แล้ว");
+  renderPayoff();
+};
+wiEl("wiKind").addEventListener("change", wiSyncForm);
+wiEl("wiExpiry").addEventListener("change", wiRebuildStrike);
+wiEl("wiStrike").addEventListener("change", wiSyncQty);
+wiEl("wiType").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  wiType = b.dataset.t === "put" ? "put" : "call";
+  [...e.currentTarget.querySelectorAll("button")].forEach(x => x.classList.toggle("active", x === b));
+  wiRebuildStrike();
+});
+wiEl("wiSide").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  wiSide = Number(b.dataset.s) < 0 ? -1 : 1;
+  [...e.currentTarget.querySelectorAll("button")].forEach(x => x.classList.toggle("active", x === b));
+});
+wiEl("btnWiAdd").onclick = wiAdd;
+
+wiLoad();
 
 /* ---------- payoff: events ---------- */
 document.getElementById("btnPayoff").onclick = () => {
@@ -2366,8 +2786,35 @@ document.getElementById("payoffRange").addEventListener("input", e => {
 });
 document.getElementById("payoffLegs").addEventListener("change", e => {
   const cb = e.target.closest(".pf-leg");
-  if (!cb) return;
-  if (cb.checked) payoffOff.delete(cb.dataset.k); else payoffOff.add(cb.dataset.k);
+  if (cb) {
+    if (cb.checked) payoffOff.delete(cb.dataset.k); else payoffOff.add(cb.dataset.k);
+    return renderPayoff();
+  }
+  const num = e.target.closest(".wi-num");          // แก้จำนวน/ราคาเข้าของขา what-if
+  if (!num) return;
+  const it = wiById(num.dataset.id);
+  if (!it) return;
+  const v = Number(num.value);
+  if (!(v > 0) || !isFinite(v)) { num.classList.add("bad"); return; }   // ค่าเสีย = ไม่แตะ state
+  num.classList.remove("bad");
+  if (num.classList.contains("wi-qty")) it.qty = v; else it.entryPrice = v;
+  wiSave();
+  renderPayoff();
+});
+document.getElementById("payoffLegs").addEventListener("click", e => {
+  const del = e.target.closest(".wi-del");
+  if (del) {
+    payoffOff.delete(PayoffMap.whatIfKeyOf(del.dataset.id));
+    whatIfList = whatIfList.filter(x => x.id !== del.dataset.id);
+    wiSave();
+    return renderPayoff();
+  }
+  const sd = e.target.closest(".wi-side");
+  if (!sd) return;
+  const it = wiById(sd.dataset.id);
+  if (!it) return;
+  it.side = it.side > 0 ? -1 : 1;
+  wiSave();
   renderPayoff();
 });
 document.getElementById("payoffSvg").addEventListener("mousemove", payoffCrosshair);
