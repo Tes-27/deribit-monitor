@@ -997,7 +997,7 @@ root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, 
 <script>
 "use strict";
 
-const BUILD = "2026-09-17c"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-27a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -1607,6 +1607,13 @@ async function deribitAuth(acc) {
 }
 
 // Deribit เลิกส่ง estimated_liquidation_price แล้ว — คำนวณเองแบบ cross margin:
+// Deribit: สัญญา linear (BTC_USDC/USDT) ส่ง size เป็นมูลค่า USDC ส่วนจำนวน BTC อยู่ใน size_currency
+function deribitSizeBtc(p) {
+  const sc = Math.abs(Number(p.size_currency) || 0);
+  if (sc > 0) return sc;
+  return p.mark_price > 0 ? Math.abs(p.size) / p.mark_price : 0;
+}
+
 // แก้สมการ equity(P) = maintenance margin(P) โดยสอบเทียบ MMR จาก maintenance_margin
 // จริงของ position (รวม tier แล้ว) · equity ของ position อื่นถูกหักส่วน MM ออกก่อน
 // extraUsd = หลักประกันสกุลอื่น (USDC/USDT) คิดเป็น USD — บัญชี cross-collateral/PM ใช้ค้ำ position BTC ได้
@@ -1627,16 +1634,18 @@ function deribitLiqEstimate(p, cat, sums, extraUsd = 0) {
     const den = S / M - eq;
     return den > 0 ? (S * (1 - r) + extraUsd) / den : null; // den<=0 = BTC หนาพอ ไม่โดน liq
   }
-  if (cat === "future") { // linear settle USDC
+  if (cat === "future") { // linear settle USDC — S ต้องเป็นจำนวน BTC ไม่ใช่มูลค่า USDC
     const sum = sums[1];
     if (!sum || !(sum.equity > 0)) return null;
+    const Sb = deribitSizeBtc(p);
+    if (!(Sb > 0)) return null;
     const eq = sum.equity - Math.max(0, (sum.maintenance_margin || 0) - (p.maintenance_margin || 0));
-    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (S * M) : 0.005;
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (Sb * M) : 0.005;
     if (dirBuy) {
-      const v = (M - eq / S) / (1 - r);
+      const v = (M - eq / Sb) / (1 - r);
       return v > 0 ? v : null;
     }
-    return (M + eq / S) / (1 + r);
+    return (M + eq / Sb) / (1 + r);
   }
   return null; // option ไม่คำนวณ
 }
@@ -1666,9 +1675,11 @@ function deribitLiqAfterFills(p, cat, sums, rawOrders, extraUsd = 0) {
     return den > 0 ? (S2 * (1 - r) + extraUsd) / den : null;
   }
   if (cat === "future") {
-    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (S * M) : 0.005;
-    const WB = eqEff - (dirBuy ? 1 : -1) * S * (M - E);
-    let S2 = S, cost2 = S * E;
+    const Sb = deribitSizeBtc(p);            // จำนวน BTC (order ของ linear ระบุ amount เป็น BTC อยู่แล้ว)
+    if (!(Sb > 0)) return null;
+    const r = p.maintenance_margin > 0 ? p.maintenance_margin / (Sb * M) : 0.005;
+    const WB = eqEff - (dirBuy ? 1 : -1) * Sb * (M - E);
+    let S2 = Sb, cost2 = Sb * E;
     adds.forEach(o => { const q = o.amount - (o.filled_amount || 0); S2 += q; cost2 += q * o.price; });
     if (dirBuy) { const num = cost2 - WB; return num > 0 ? num / (S2 * (1 - r)) : null; }
     return (cost2 + WB) / (S2 * (1 + r));
@@ -1698,12 +1709,13 @@ async function refreshDeribit(acc) {
     return {
       key: ikey("deribit", cat, p.instrument_name),
       symbol: p.instrument_name, cat,
-      dirBuy: p.direction === "buy", size: Math.abs(p.size),
+      dirBuy: p.direction === "buy",
+      size: cat === "future" ? deribitSizeBtc(p) : Math.abs(p.size), // linear = BTC, inverse = USD
       entry: p.average_price, mark: p.mark_price,
       index: p.index_price || null, // เพิ่มมาเพื่อใช้เป็น spot สำรองในแผง payoff
       liq, liqEst,
       liqFills: deribitLiqAfterFills(p, cat, sums, rawOrders, extraUsd),
-      upnl: p.floating_profit_loss, upnlCcy: "",
+      upnl: p.floating_profit_loss, upnlCcy: cat === "future" ? "USDC" : "",
     };
   });
   acc.orders = rawOrders.map(o => ({
