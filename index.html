@@ -997,7 +997,7 @@ root.PayoffMap = { positionsToLegs, parseDeribit, deribitExpiryTs, isBtcSymbol, 
 <script>
 "use strict";
 
-const BUILD = "2026-09-27a"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
+const BUILD = "2026-09-27b"; // ไว้เช็คว่า browser รันเวอร์ชันล่าสุดหรือติด cache
 console.log("position-monitor build", BUILD);
 
 /* ================= storage / config ================= */
@@ -1063,6 +1063,48 @@ let instrument = store.get("deribit_monitor_instrument") || "deribit|inverse|BTC
 if (!instrument.includes("|")) instrument = ikey("deribit", deribitCat(instrument), instrument);
 let tfLabel = store.get("deribit_monitor_tf") || "1h";
 let activeTab = store.get("deribit_monitor_tab") || "overview";
+
+/* ---------- แต่ละ tab จำกราฟของตัวเอง (tab ผูกกับ exchange+ชื่อพอร์ท ไม่ใช่ลำดับ ซึ่งเลื่อนได้) ---------- */
+const TAB_INST_KEY = "deribit_monitor_tab_instrument";
+const INST_KEY_RE = /^(deribit|bybit|phemex)\|(inverse|future|option|spot)\|[A-Za-z0-9_.\-]{1,64}$/;
+function tabInstMap() {
+  let m;
+  try { m = JSON.parse(store.get(TAB_INST_KEY) || "{}"); } catch { m = {}; }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return {};
+  const out = {};
+  Object.keys(m).slice(0, 50).forEach(k => {
+    if (typeof m[k] === "string" && INST_KEY_RE.test(m[k]) && k.length <= 200) out[k] = m[k];
+  });
+  return out;
+}
+function tabKeyOf(tab) {
+  if (tab === "overview") return "overview";
+  const a = accounts[parseInt(tab, 10)];
+  return a ? a.exchange + "|" + a.name : null;
+}
+/** เปลี่ยน instrument ของกราฟ + จำไว้กับ tab ที่เปิดอยู่ */
+function setInstrument(k) {
+  instrument = k;
+  store.set("deribit_monitor_instrument", k);
+  const tk = tabKeyOf(activeTab);
+  if (tk && INST_KEY_RE.test(k)) {
+    const m = tabInstMap();
+    m[tk] = k;
+    store.set(TAB_INST_KEY, JSON.stringify(m));
+  }
+}
+/** instrument ที่ควรแสดงเมื่อเปิด tab นี้: ที่จำไว้ → position แรกของพอร์ท → คงของเดิม */
+function instrumentForTab(tab) {
+  const tk = tabKeyOf(tab);
+  const saved = tk ? tabInstMap()[tk] : null;
+  if (saved) return saved;
+  const a = tab === "overview" ? null : accounts[parseInt(tab, 10)];
+  if (a && a.positions.length && !a.positions.some(p => p.key === instrument)) {
+    const p = a.positions.find(x => x.cat !== "spot" && INST_KEY_RE.test(x.key));
+    if (p) return p.key;
+  }
+  return instrument;
+}
 
 /* ================= utils ================= */
 const fmt = n => n == null || isNaN(n) ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 8 });
@@ -2106,8 +2148,17 @@ document.getElementById("tabbar").addEventListener("click", e => {
   if (!tab) return;
   activeTab = tab.dataset.tab;
   store.set("deribit_monitor_tab", activeTab);
-  renderAll();
-  refreshTradeMarkers(); // ชุดพอร์ทที่มองเห็นเปลี่ยน → marker เปลี่ยนตาม
+  const want = instrumentForTab(activeTab);
+  if (want !== instrument) {
+    instrument = want;
+    store.set("deribit_monitor_instrument", want);
+    rebuildInstrumentSel();
+    loadChart().catch(console.error); // loadChart เรียก refreshTradeMarkers ให้เองหลังโหลดแท่ง
+    renderAll();
+  } else {
+    renderAll();
+    refreshTradeMarkers(); // ชุดพอร์ทที่มองเห็นเปลี่ยน → marker เปลี่ยนตาม
+  }
   if (payoffOpen) payoffFetch(); // ชุด instrument ที่ต้องใช้ ticker เปลี่ยนตามด้วย
 });
 
@@ -2893,8 +2944,7 @@ document.getElementById("instrumentSel").addEventListener("change", e => {
     optPickOpen();
     return;
   }
-  instrument = e.target.value;
-  store.set("deribit_monitor_instrument", instrument);
+  setInstrument(e.target.value);
   loadChart().catch(console.error);
 });
 
@@ -2946,8 +2996,7 @@ optPickEl("optPickGo").onclick = () => {
   const inst = wiChain.opt.find(i => Number(i.expiration_timestamp) === ts
     && Number(i.strike) === k && i.option_type === want);
   if (!inst) { optPickEl("optPickStatus").textContent = "ไม่มีสัญญานี้ในกระดาน"; return; }
-  instrument = ikey("deribit", "option", inst.instrument_name);
-  store.set("deribit_monitor_instrument", instrument);
+  setInstrument(ikey("deribit", "option", inst.instrument_name));
   rememberOption(inst.instrument_name);
   optPickEl("optPickModal").classList.remove("show");
   rebuildInstrumentSel();
@@ -2957,8 +3006,7 @@ optPickEl("optPickGo").onclick = () => {
 document.querySelector("footer").addEventListener("click", e => {
   const row = e.target.closest("[data-inst]");
   if (!row) return;
-  instrument = row.dataset.inst;
-  store.set("deribit_monitor_instrument", instrument);
+  setInstrument(row.dataset.inst);
   rebuildInstrumentSel();
   loadChart().catch(console.error);
 });
@@ -3017,6 +3065,8 @@ function boot() {
   buildAccounts();
   if (activeTab !== "overview" && !accounts[parseInt(activeTab, 10)]) activeTab = "overview";
   if (accounts.length === 1) activeTab = "0";
+  const savedForTab = tabInstMap()[tabKeyOf(activeTab)];
+  if (savedForTab) instrument = savedForTab;
   renderAll();
   renderTf(iparse(instrument).ex);
   startPublic();               // deribit public: instruments + กราฟ deribit
